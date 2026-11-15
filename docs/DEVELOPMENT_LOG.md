@@ -4,6 +4,57 @@
 
 ---
 
+## 2026-11-15 — Issue #26: гонка WAL при открытии хранилища (TOCTOU)
+
+Отдельная работа: [Issue #26](https://github.com/Inlerno/ATLAS/issues/26). PR #25 добавил первоначальную SQLite Foundation и слит в `main` 2026-11-15 (`0580304`) **без** этого исправления: гонка обнаружена после его слияния. Исправление опубликовано отдельным [PR #27](https://github.com/Inlerno/ATLAS/pull/27) из той же ветки `feature/sqlite-foundation` (новая ветка не создавалась — решение пользователя) и в `main` пока не слито. Независимое ревью нашло окно между проверкой режима журнала и записью: файл `atlas.db-wal`, появившийся после проверки, подхватывался следующим оператором, и проба записи или миграции писали в чужой WAL (воспроизведено: WAL 12 392 → 32 992 байта, файл базы без изменений). Решения утверждены пользователем; запись — ADR-016.
+
+### Что сделано
+- **Проверка режима внутри транзакции.** Проба записи и миграции: `BEGIN` → чтение файла → `PRAGMA journal_mode` → работа только при `delete`, иначе `ROLLBACK` и `Unavailable` (`step=probe-journal-mode`, `step=migrations-journal-mode`). Так же — читающая проверка миграций ветки `ReadOnly`. Прежние проверки (после первого чтения и итоговая) сохранены.
+- **Миграции одного запуска атомарны.** Одна внешняя транзакция: проверка режима → `Migrator::run_direct` без изменений → `COMMIT` после успеха всего набора; ошибка миграции — `ROLLBACK` набора; ошибка `COMMIT` — `Unavailable` (`step=migrations-commit`). **Изменение поведения:** раньше при ошибке второй миграции первая оставалась применённой; теперь не остаётся ничего. Тест `failed_migration_leaves_no_trace` заменён на `failed_migration_rolls_back_the_whole_run` — ожидание изменено по утверждённому решению, а не ослаблено.
+- **Совместимость `run_direct` с внешней транзакцией** — по исходному коду `sqlx 0.8.6`: `Migrate::apply` (`vendor/sqlx-sqlite/src/migrate.rs`) вызывает `self.begin()` и `tx.commit()`; поток соединения (`src/connection/worker.rs`) по счётчику глубины выполняет на глубине 0 `BEGIN`, глубже — `SAVEPOINT _sqlx_savepoint_N`, а при фиксации — `COMMIT` только на глубине 1, иначе `RELEASE SAVEPOINT` (`sqlx-core/src/transaction.rs`: `begin_ansi_transaction_sql`, `commit_ansi_transaction_sql`, `rollback_ansi_transaction_sql`). Внутри внешней транзакции мигратор внешний `COMMIT` не выполняет; при ошибке миграции её транзакция уничтожается (откат к точке сохранения), ошибка возвращается вызывающему. Блокировки мигратора для SQLite — пустые операции.
+- **Сценарий ручной проверки** `tools/windows/sqlite-foundation-check.ps1` (PowerShell 5.1 и 7, только ASCII): 13 сценариев, отчёт в `$HOME\atlas-sqlite-check-<время>`. Существующий каталог `%LOCALAPPDATA%\com.inlerno.atlas` переименовывается в `com.inlerno.atlas.sqlite-check-backup-<время>` с проверкой, на его месте создаётся пустой каталог с файлом-меткой, перед каждым разрушающим шагом метка проверяется, в `finally` тестовый каталог уносится в отчёт, а резервный возвращается. Резервный каталог не удаляется и не перезаписывается; режим `-RestoreOnly` — для прерванного запуска.
+- Документация: ADR-016, `ARCHITECTURE.md`, `README.md`.
+
+### Новые тесты и что они ловят
+| Тест | Какой дефект предотвращает | Linux |
+|---|---|---|
+| `wal_slipped_in_before_the_write_probe_is_refused_inside_its_transaction` | проба записи пишет в WAL, появившийся после первой проверки | пройден: `step=probe-journal-mode mode=wal`, база и WAL побайтно те же |
+| `wal_slipped_in_before_the_migrations_is_refused_and_nothing_is_migrated` | миграции уходят в чужой WAL | пройден: `step=migrations-journal-mode mode=wal`, миграций нет, база и WAL те же |
+| `known_limit_wal_appearing_inside_the_migration_transaction` | фиксирует остаточное ограничение, чтобы оно не изменилось незаметно | пройден: транзакция завершается в журнале отката, WAL побайтно тот же, база изменена миграцией, итог `step=journal-mode-final mode=wal`, появился `-shm` |
+| `several_migrations_are_committed_together_and_the_storage_is_ready` | внешняя транзакция ломает обычный путь | пройден |
+| `failed_migration_rolls_back_the_whole_run` | после ошибки остаётся часть набора; повторный запуск не применяет набор заново | пройден |
+| `commit_that_fails_applies_nothing_and_the_storage_is_not_ready` | `Ready` без успешного `COMMIT` | пройден: читатель держит блокировку, `step=migrations-commit code=5` |
+| `read_only_branch_checks_the_journal_mode_inside_its_transactions` | ветка `ReadOnly` обходит проверку режима или пишет | пройден |
+
+Чувствительность: при выключенной проверке внутри транзакции падают 4 теста (первые три и последний). **Не воспроизведено:** ошибка `ROLLBACK` — детерминированного способа нет; покрыта только классификация (`classify_probe`).
+
+### Проверки в облачном окружении Claude (Linux, НЕ Windows)
+Ubuntu 24.04 x86_64, rustc 1.97.0, SQLite 3.54.1; `cargo` с `--offline` (реестр в окружении недоступен, `Cargo.lock` не менялся).
+
+| Команда | Результат |
+|---|---|
+| `npm run build`; `cargo fmt --check`; `git diff --check` | OK |
+| `cargo clippy --locked --all-targets -- -D warnings` (также `--features demo-modules`, `--all-features`) | OK |
+| `cargo test --locked` / `--release` | unit: 277 пройдено, 0 провалено, 3 пропущены; интеграционные 1 + 1 + 1 |
+| `cargo test --locked --features demo-modules` / `--release` | unit: 286 пройдено, 3 пропущены; интеграционные 1 + 1 + 1 |
+| `cargo doc --locked --no-deps` (и с `-D warnings --document-private-items`); `cargo build --locked` (обе конфигурации) | OK |
+| Тесты `storage` под непривилегированным пользователем | 71 пройден, 3 пропущены |
+| Тесты `storage`, 5 прогонов подряд | 71 пройден в каждом |
+| `full_disk_is_unavailable_not_read_only` на заполненном tmpfs | пройден (`step=probe code=13`) |
+| `cargo tree -i libsqlite3-sys`; `cargo tree --all-features -e all -i rsa` (Linux и `x86_64-pc-windows-msvc`) | одна `0.40.0`; `rsa` в графе нет |
+| `cargo audit` | код выхода 1, как и раньше: `rsa` только в `Cargo.lock`, 2 прежних предупреждения |
+| `cargo +1.90.0 build --locked` | в облаке **не выполнено** (toolchain недоступен); выполняет Windows CI |
+| Сценарий `.ps1`: разбор PowerShell 7.4.6 | 0 ошибок; в Windows PowerShell 5.1 **не запускался** |
+| Сценарий `.ps1` на Linux-сборке под Xvfb (PowerShell 7, непривилегированный пользователь) — проверка самого сценария, **не Windows** | 13 из 13 сценариев PASS; подготовленный «чужой» каталог данных после запуска побайтно тот же. Ветки восстановления: каталога нет; ATLAS запущен (отказ до изменений); сценарий убит посреди работы → новый запуск отказывает, `-RestoreOnly` возвращает каталог; каталог занят чем-то без метки → ничего не тронуто, код 3, инструкция. Ветка «тестовый каталог не переносится в отчёт → переименование на месте» **не выполнялась** |
+
+### Остаточные ограничения
+- WAL, появившийся во время уже открытой транзакции, ею не замечается (ADR-016); ATLAS в него не пишет, база остаётся недоступной до удаления файла.
+- Защита относится к действиям ATLAS при открытии и закрытии; SQLite по-прежнему может прочитать подложенный файл, создать `-shm`, удалить `-wal` у пустой базы.
+- После открытия через соединение ничего не выполняется; MM-5B обязан проверять режим внутри каждой своей транзакции.
+
+### Windows
+Результаты Windows CI на конечном коммите — в описании PR #27: запись в этот файл изменила бы проверяемый коммит. **Вручную на Windows по-прежнему не проверялось ничего**; сценарий подготовлен, запускает пользователь. Ручная проверка перед слиянием PR #27 — **не выполнена**, решение о слиянии принимает пользователь.
+
 ## 2026-11-14 — SQLite foundation (между MM-7 и MM-5B; Issue не создан)
 
 Самостоятельная задача по решению ?-11 (вариант A): core-сервис хранения. Решения — ADR-016. Issue для неё не создавался: отдельного разрешения не было. Ветка `feature/sqlite-foundation` от `main` `ca334aa`.
@@ -82,6 +133,7 @@ CI собирает и проверяет merge-коммит PR, а не гол�
 
 ### Ручная проверка на Windows — заполняет разработчик
 > **Статус: не выполнена.**
+> Большую часть пунктов автоматизирует `tools\windows\sqlite-foundation-check.ps1` (запись от 2026-11-15); отчёт сценария прикладывается к PR.
 
 - [ ] `rustc --version`; сборка и `cargo test --locked` в `src-tauri` — OK
 - [ ] Первый запуск: появились `data\atlas.db` и `storage.initialized`; в журнале `database opened … created=true state="ready"`

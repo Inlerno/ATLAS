@@ -90,8 +90,12 @@ pub(super) struct Applied {
 ///
 /// Before anything is applied the list is validated and the versions already
 /// in the database must be exactly `1..=k` with `k` no greater than the list
-/// and with matching checksums; otherwise nothing is applied. Each migration
-/// and its record are one transaction (sqlx).
+/// and with matching checksums; otherwise nothing is applied.
+///
+/// The caller runs this inside a transaction of its own (`database::migrate`)
+/// and commits it afterwards: sqlx then wraps each migration and its record
+/// in a savepoint instead of a transaction, and the migrations of one run are
+/// applied all together or not at all.
 pub(super) async fn run(
     conn: &mut SqliteConnection,
     list: &'static [Embedded],
