@@ -1,6 +1,10 @@
 # Normalize line endings: LF in the repository and working tree on all platforms.
 * text=auto eol=lf
 
+# Migrations: a checksum of the text is stored in the database, so the line
+# endings must never depend on the platform (ADR-016).
+*.sql text eol=lf
+
 # Windows-only scripts keep CRLF.
 *.bat text eol=crlf
 *.cmd text eol=crlf
