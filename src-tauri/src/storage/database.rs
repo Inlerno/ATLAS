@@ -35,20 +35,35 @@
 //!    before any statement. Whatever this connection attached, closing it
 //!    copies nothing into the database file and deletes no WAL file.
 //!    `wal_autocheckpoint = 0` turns off the checkpoint after a commit.
-//! 3. After opening: the journal mode must be `delete`, checked after the
-//!    first read and again before the storage is reported as open. Otherwise
-//!    nothing is probed or migrated and the storage is unavailable. The mode
-//!    is never switched back: changing it away from WAL is itself a
-//!    checkpoint.
+//! 3. After opening: the journal mode must be `delete`. It is checked after
+//!    the first read, **inside every transaction that is about to write**
+//!    (the write probe, the migrations) and again before the storage is
+//!    reported as open. Otherwise nothing more is done and the storage is
+//!    unavailable. The mode is never switched back: changing it away from WAL
+//!    is itself a checkpoint.
+//!
+//! Why inside the transaction. SQLite looks for a `-wal` file only when a
+//! connection that holds no lock starts a transaction; once the transaction
+//! has read the file the mode is settled until it ends. A check made before
+//! the transaction leaves a gap in which a file can appear and the write
+//! would go into it; a check made inside, after the first read and before the
+//! first write, leaves none: if it says `delete`, this transaction writes
+//! through the rollback journal into the database itself, and if it says
+//! `wal`, the transaction is rolled back having written nothing.
+//! `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` alone does not do this: it keeps a WAL
+//! from being copied into the database on close, not from being written to.
 //!
 //! What this does **not** give. The checks are not a lock: a process that may
 //! write to the data directory at the same moment can slip a file in after
 //! the check. SQLite then reads it; it creates or rewrites the `-shm` file;
 //! on a first run, with the database still empty, it deletes the `-wal` file
-//! itself. A `-wal` file that appears while the session runs is attached by
-//! the next read, which then sees foreign content: whoever reads through this
-//! connection later (MM-5B) must check the journal mode before each
-//! transaction.
+//! itself. A `-wal` file that appears while a transaction is already open is
+//! not noticed by it: the transaction changes the database as intended and
+//! the stray file is left beside a database it no longer matches. A `-wal`
+//! file that appears while the session runs is attached by the next
+//! transaction, which then sees foreign content: whoever reads or writes
+//! through this connection later (MM-5B) must make the same check inside each
+//! of its transactions.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
@@ -56,6 +71,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteSynchronous};
 use sqlx::{ConnectOptions, Connection};
+use sqlx::{Sqlite, Transaction};
 
 use super::StorageError;
 use super::migrations::{self, Embedded};
@@ -129,6 +145,18 @@ pub(super) struct Settings {
     /// the moment another process could slip a file in.
     #[cfg(test)]
     pub before_connect: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Runs after the first check of the journal mode, right before the write
+    /// probe begins its transaction.
+    #[cfg(test)]
+    pub before_probe: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Runs after the write probe, right before the transaction of the
+    /// migrations begins.
+    #[cfg(test)]
+    pub before_migrations: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Runs inside the transaction of the migrations, after its check of the
+    /// journal mode and before anything is migrated.
+    #[cfg(test)]
+    pub inside_migrations: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Runs after the migrations, right before the last check of the journal
     /// mode.
     #[cfg(test)]
@@ -147,6 +175,12 @@ impl Settings {
             before_lock: None,
             #[cfg(test)]
             before_connect: None,
+            #[cfg(test)]
+            before_probe: None,
+            #[cfg(test)]
+            before_migrations: None,
+            #[cfg(test)]
+            inside_migrations: None,
             #[cfg(test)]
             before_final_check: None,
         }
@@ -415,6 +449,30 @@ async fn require_rollback_journal(
     }
 }
 
+/// Begins a transaction and checks, inside it, that it runs on the rollback
+/// journal (module documentation, "Why inside the transaction"). On any
+/// failure the transaction is rolled back before the error is returned.
+async fn begin_on_rollback_journal<'c>(
+    conn: &'c mut SqliteConnection,
+    step: &str,
+) -> Result<Transaction<'c, Sqlite>, StorageError> {
+    let mut transaction = conn
+        .begin()
+        .await
+        .map_err(|error| unavailable(&format!("{step}-begin"), &Failure::of(&error)))?;
+    // `BEGIN` takes no lock: the read inside the check is what starts the
+    // transaction in SQLite and settles the journal mode for its duration.
+    if let Err(error) =
+        require_rollback_journal(&mut transaction, &format!("{step}-journal-mode")).await
+    {
+        // Nothing was written. Should the rollback fail as well, the caller
+        // closes the connection, which ends the transaction.
+        let _ = transaction.rollback().await;
+        return Err(error);
+    }
+    Ok(transaction)
+}
+
 /// Read check, journal mode, write probe, then the migrations (the migrator
 /// for a writable database, a check that writes nothing for a read-only one),
 /// then the journal mode once more.
@@ -434,39 +492,100 @@ async fn prepare(
         .fetch_one(&mut *conn)
         .await
         .map_err(|error| unavailable("read", &Failure::of(&error)))?;
+    #[cfg(test)]
+    if let Some(hook) = &settings.before_probe {
+        hook();
+    }
     let access = match probe_write(conn).await? {
         Verdict::Writable => Access::ReadWrite,
         Verdict::ReadOnly(code) => Access::ReadOnly { code },
         Verdict::Unavailable(reason) => return Err(StorageError::Open(reason)),
     };
-    let applied = match access {
-        Access::ReadWrite => migrations::run(conn, settings.migrations).await,
-        // The migrator could try to write: only the reading check runs.
-        Access::ReadOnly { .. } => migrations::verify_read_only(conn, settings.migrations).await,
+    #[cfg(test)]
+    if let Some(hook) = &settings.before_migrations {
+        hook();
     }
-    .map_err(StorageError::Migration)?;
+    let applied = migrate(conn, settings, access).await?;
     #[cfg(test)]
     if let Some(hook) = &settings.before_final_check {
         hook();
     }
-    // A `-wal` file that appeared since the first check was attached by one
-    // of the statements above: the storage must not be reported as open.
+    // A `-wal` file that appeared since the last transaction is attached by
+    // this read: the storage must not be reported as open.
     require_rollback_journal(conn, "journal-mode-final").await?;
     Ok((access, sqlite_version, applied))
+}
+
+/// The migrations of this run, as one transaction: all of them are committed
+/// together or none is.
+///
+/// The journal mode is checked inside that transaction before anything is
+/// written, so the migrations cannot be written into a foreign WAL. The
+/// migrator of sqlx runs inside it: its own `begin` and `commit` for each
+/// migration become `SAVEPOINT` and `RELEASE` (sqlx counts the depth and
+/// issues `COMMIT` only at depth 1), so nothing is committed before the
+/// `COMMIT` here.
+///
+/// A database that cannot be written is only read, in a transaction of the
+/// same kind that is always rolled back.
+async fn migrate(
+    conn: &mut SqliteConnection,
+    settings: &Settings,
+    access: Access,
+) -> Result<migrations::Applied, StorageError> {
+    let mut transaction = begin_on_rollback_journal(conn, "migrations").await?;
+    #[cfg(test)]
+    if let Some(hook) = &settings.inside_migrations {
+        hook();
+    }
+    match access {
+        Access::ReadWrite => {
+            match migrations::run(&mut transaction, settings.migrations).await {
+                Ok(applied) => {
+                    // A failed `COMMIT` leaves nothing applied: sqlx rolls
+                    // the transaction back when it is dropped, and the caller
+                    // closes the connection.
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|error| unavailable("migrations-commit", &Failure::of(&error)))?;
+                    Ok(applied)
+                }
+                Err(error) => {
+                    // Everything this run applied goes with it.
+                    let _ = transaction.rollback().await;
+                    Err(StorageError::Migration(error))
+                }
+            }
+        }
+        // The migrator could try to write: only the reading check runs.
+        Access::ReadOnly { .. } => {
+            let verified =
+                migrations::verify_read_only(&mut transaction, settings.migrations).await;
+            let _ = transaction.rollback().await;
+            verified.map_err(StorageError::Migration)
+        }
+    }
 }
 
 /// The write probe: sets `PRAGMA user_version` to its current value inside a
 /// transaction and rolls it back. Neither sqlx nor ATLAS uses `user_version`;
 /// the file content does not change.
+///
+/// The transaction first checks its journal mode: a probe that found itself
+/// in WAL mode writes nothing and the storage is unavailable.
 async fn probe_write(conn: &mut SqliteConnection) -> Result<Verdict, StorageError> {
-    let current: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut *conn)
+    let mut transaction = begin_on_rollback_journal(conn, "probe").await?;
+    let current: i64 = match sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *transaction)
         .await
-        .map_err(|error| unavailable("probe-read", &Failure::of(&error)))?;
-    let mut transaction = conn
-        .begin()
-        .await
-        .map_err(|error| unavailable("probe-begin", &Failure::of(&error)))?;
+    {
+        Ok(current) => current,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(unavailable("probe-read", &Failure::of(&error)));
+        }
+    };
     // An integer read from the database itself: not text from outside.
     let write = sqlx::query(&format!("PRAGMA user_version = {current}"))
         .execute(&mut *transaction)

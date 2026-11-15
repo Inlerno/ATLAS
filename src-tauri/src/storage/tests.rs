@@ -1326,6 +1326,173 @@ fn wal_slipped_in_before_the_last_check_stops_the_opening() {
     });
 }
 
+/// Scenario A. Guards against a write probe that runs in WAL mode: the file
+/// appears after the first check of the journal mode, the probe attaches it
+/// when its transaction starts, and must stop before writing.
+#[test]
+fn wal_slipped_in_before_the_write_probe_is_refused_inside_its_transaction() {
+    run(async {
+        let root = TempRoot::new("wal-before-probe");
+        let elsewhere = TempRoot::new("wal-before-probe-source");
+        let layout = root.layout();
+        session(&layout, ONE).await;
+        insert_item(&layout, "kept").await;
+        let (wal, _shm) = real_wal_for(&layout, elsewhere.path()).await;
+        let database = fs::read(&layout.database).expect("database");
+
+        let mut settings = Settings::new(ONE);
+        settings.before_probe = Some(planter(vec![(layout.wal.clone(), wal.clone())]));
+        assert_eq!(
+            reason(open_with(&layout, &settings).await),
+            "step=probe-journal-mode mode=wal expected=delete"
+        );
+        assert_eq!(fs::read(&layout.database).expect("database"), database);
+        assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+        assert!(!database_alone_has_planted(&layout).await);
+        // Not promised to stay away: SQLite creates it when it attaches a WAL.
+        assert!(layout.shm.is_file());
+
+        // Through the service: unavailable (a fresh copy of the situation).
+        let root = TempRoot::new("wal-before-probe-service");
+        let layout = root.layout();
+        session(&layout, ONE).await;
+        let mut settings = Settings::new(ONE);
+        settings.before_probe = Some(planter(vec![(layout.wal.clone(), wal.clone())]));
+        let storage = Storage::with_settings(Ok(root.path().to_path_buf()), settings);
+        storage.open().await;
+        assert_eq!(storage.kind().await, "unavailable");
+        storage.close().await;
+        assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+    });
+}
+
+/// Scenario B. Guards against migrations written into a foreign WAL: the
+/// file appears after the write probe, a migration is waiting, and without
+/// the check inside the transaction sqlx would commit it into that file.
+#[test]
+fn wal_slipped_in_before_the_migrations_is_refused_and_nothing_is_migrated() {
+    run(async {
+        let root = TempRoot::new("wal-before-migrations");
+        let elsewhere = TempRoot::new("wal-before-migrations-source");
+        let layout = root.layout();
+        session(&layout, ONE).await;
+        let (wal, _shm) = real_wal_for(&layout, elsewhere.path()).await;
+        let database = fs::read(&layout.database).expect("database");
+
+        // The second migration has not been applied yet.
+        let mut settings = Settings::new(TWO);
+        settings.before_migrations = Some(planter(vec![(layout.wal.clone(), wal.clone())]));
+        assert_eq!(
+            reason(open_with(&layout, &settings).await),
+            "step=migrations-journal-mode mode=wal expected=delete"
+        );
+        // Neither file received the migration.
+        assert_eq!(fs::read(&layout.database).expect("database"), database);
+        assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+
+        // Once the user has removed the files: the migration is still to be
+        // applied, and it is.
+        fs::remove_file(&layout.wal).expect("remove by hand");
+        fs::remove_file(&layout.shm).expect("remove by hand");
+        let mut conn = raw(&layout).await;
+        assert_eq!(applied_versions(&mut conn).await, vec![1]);
+        conn.close().await.expect("close");
+        assert_eq!(session(&layout, TWO).await, (Access::ReadWrite, false, 1));
+        assert!(!database_alone_has_planted(&layout).await);
+    });
+}
+
+/// Scenario C, a known limit kept visible. A `-wal` file that appears while
+/// the transaction of the migrations is already open is not noticed by that
+/// transaction: SQLite settled its journal mode at its first read. What
+/// holds: ATLAS writes nothing into the foreign file — the migrations go into
+/// the database through the rollback journal. What does not: the foreign file
+/// now lies beside a database it no longer matches, SQLite creates `-shm`
+/// when the next transaction attaches it, and the opening then stops at the
+/// last check — with the migrations committed.
+#[test]
+fn known_limit_wal_appearing_inside_the_migration_transaction() {
+    run(async {
+        let root = TempRoot::new("wal-inside-migrations");
+        let elsewhere = TempRoot::new("wal-inside-migrations-source");
+        let layout = root.layout();
+        session(&layout, ONE).await;
+        let (wal, _shm) = real_wal_for(&layout, elsewhere.path()).await;
+        let database = fs::read(&layout.database).expect("database");
+
+        let mut settings = Settings::new(TWO);
+        settings.inside_migrations = Some(planter(vec![(layout.wal.clone(), wal.clone())]));
+        assert_eq!(
+            reason(open_with(&layout, &settings).await),
+            "step=journal-mode-final mode=wal expected=delete"
+        );
+
+        // The foreign WAL: byte for byte what was planted.
+        assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+        // The database: changed, by the migration alone.
+        assert_ne!(fs::read(&layout.database).expect("database"), database);
+        assert!(!database_alone_has_planted(&layout).await);
+        // `-shm`: created by SQLite when the last check attached the WAL.
+        assert!(layout.shm.is_file());
+
+        // With the files removed by hand the database is the migrated one.
+        fs::remove_file(&layout.wal).expect("remove by hand");
+        fs::remove_file(&layout.shm).expect("remove by hand");
+        let mut conn = raw(&layout).await;
+        assert_eq!(applied_versions(&mut conn).await, vec![1, 2]);
+        conn.close().await.expect("close");
+        assert_eq!(session(&layout, TWO).await, (Access::ReadWrite, false, 0));
+    });
+}
+
+/// Scenario G. Guards the read-only branch: it writes nothing, and it does
+/// not read the migration records around the check of the journal mode — a
+/// WAL that appears before its transaction stops it like any other.
+#[test]
+fn read_only_branch_checks_the_journal_mode_inside_its_transactions() {
+    run(async {
+        for (step, expected) in [
+            ("probe", "step=probe-journal-mode mode=wal expected=delete"),
+            (
+                "migrations",
+                "step=migrations-journal-mode mode=wal expected=delete",
+            ),
+        ] {
+            let root = TempRoot::new("wal-read-only");
+            let elsewhere = TempRoot::new("wal-read-only-source");
+            let layout = root.layout();
+            session(&layout, ONE).await;
+            let (wal, _shm) = real_wal_for(&layout, elsewhere.path()).await;
+            let database = fs::read(&layout.database).expect("database");
+
+            // Without a WAL: read-only, and nothing is written.
+            let mut settings = Settings::new(ONE);
+            settings.read_only_handle = true;
+            let opened = open_with(&layout, &settings).await.expect("opens");
+            assert!(matches!(opened.access, Access::ReadOnly { .. }), "{step}");
+            opened.conn.close().await.expect("close");
+            assert_eq!(fs::read(&layout.database).expect("database"), database);
+
+            // With a WAL appearing before the transaction of that step.
+            let plant = planter(vec![(layout.wal.clone(), wal.clone())]);
+            let mut settings = Settings::new(ONE);
+            settings.read_only_handle = true;
+            if step == "probe" {
+                settings.before_probe = Some(plant);
+            } else {
+                settings.before_migrations = Some(plant);
+            }
+            assert_eq!(
+                reason(open_with(&layout, &settings).await),
+                expected,
+                "{step}"
+            );
+            assert_eq!(fs::read(&layout.database).expect("database"), database);
+            assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+        }
+    });
+}
+
 /// Known limit, kept visible: on a first run the database is still empty when
 /// SQLite first reads it, and SQLite itself deletes a `-wal` file it finds
 /// then. Nothing of it reaches the database, but the file is gone.
@@ -1826,9 +1993,12 @@ fn migrations_are_applied_once_and_only_the_missing_ones() {
     });
 }
 
+/// Guards the atomicity of a run: with a transaction per migration the
+/// first migration would stay applied when the second fails.
 #[test]
-fn failed_migration_leaves_no_trace() {
+fn failed_migration_rolls_back_the_whole_run() {
     run(async {
+        // On a first run: nothing at all is left.
         let root = TempRoot::new("broken");
         let layout = root.layout();
         let error = reason(open(&layout, BROKEN).await);
@@ -1838,20 +2008,115 @@ fn failed_migration_leaves_no_trace() {
         assert!(!layout.marker.exists());
 
         let mut conn = raw(&layout).await;
-        // The first migration stays; the failed one left neither its first
-        // statement nor a record.
-        assert_eq!(applied_versions(&mut conn).await, vec![1]);
+        // Neither the first migration, which succeeded, nor the first
+        // statement of the failed one, nor the table of the migrator.
+        assert_eq!(
+            count(&mut conn, "SELECT count(*) FROM sqlite_master").await,
+            0
+        );
+        conn.close().await.expect("close");
+
+        // Through the service the storage is not ready.
+        let storage = Storage::for_test(root.path(), BROKEN);
+        storage.open().await;
+        assert_eq!(storage.kind().await, "unavailable");
+        storage.close().await;
+
+        // With the cause removed the same database gets the whole set.
+        assert_eq!(session(&layout, TWO).await, (Access::ReadWrite, false, 2));
+
+        // On a database that already has migrations: what was there stays,
+        // nothing of the failed run does.
+        let root = TempRoot::new("broken-later");
+        let layout = root.layout();
+        session(&layout, NONE).await;
+        let before = fs::read(&layout.database).expect("database");
+        let error = reason(open(&layout, BROKEN).await);
+        assert!(error.contains("migration 2"), "{error}");
+        assert_eq!(fs::read(&layout.database).expect("database"), before);
+        let mut conn = raw(&layout).await;
+        assert_eq!(applied_versions(&mut conn).await, Vec::<i64>::new());
         assert_eq!(
             count(
                 &mut conn,
-                "SELECT count(*) FROM sqlite_master WHERE name = 'half'"
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('items', 'half')"
             )
             .await,
             0
         );
         conn.close().await.expect("close");
+        assert_eq!(session(&layout, TWO).await, (Access::ReadWrite, false, 2));
+    });
+}
 
-        // The same database works with a correct list.
+/// Guards the other half of the atomicity: a set of migrations that succeeds
+/// is committed as a whole and the storage becomes ready.
+#[test]
+fn several_migrations_are_committed_together_and_the_storage_is_ready() {
+    run(async {
+        let root = TempRoot::new("several");
+        let layout = root.layout();
+        let storage = Storage::for_test(root.path(), TWO);
+        storage.open().await;
+        assert_eq!(storage.kind().await, "ready");
+        storage.close().await;
+        let mut conn = raw(&layout).await;
+        assert_eq!(applied_versions(&mut conn).await, vec![1, 2]);
+        // The second migration added a column to the table of the first.
+        assert_eq!(
+            count(&mut conn, "SELECT count(*) FROM pragma_table_info('items')").await,
+            3
+        );
+        assert_eq!(journal_mode(&mut conn).await, "delete");
+        conn.close().await.expect("close");
+        assert!(!layout.data_dir.join("atlas.db-journal").exists());
+    });
+}
+
+/// Guards against reporting the storage as open after a `COMMIT` that did not
+/// happen. A reader in another connection holds a shared lock: the migration
+/// can be prepared, but its `COMMIT` cannot get the exclusive lock and fails
+/// with `SQLITE_BUSY`.
+#[test]
+fn commit_that_fails_applies_nothing_and_the_storage_is_not_ready() {
+    run(async {
+        let root = TempRoot::new("commit-busy");
+        let layout = root.layout();
+        session(&layout, ONE).await;
+        let before = fs::read(&layout.database).expect("database");
+
+        let mut reader = raw(&layout).await;
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("begin");
+        assert_eq!(count(&mut reader, "SELECT count(*) FROM items").await, 0);
+
+        let mut settings = Settings::new(TWO);
+        settings.busy_timeout = Some(Duration::from_millis(100));
+        let error = reason(open_with(&layout, &settings).await);
+        assert!(
+            error.starts_with("step=migrations-commit code=5 "),
+            "{error}"
+        );
+        let mut settings = Settings::new(TWO);
+        settings.busy_timeout = Some(Duration::from_millis(100));
+        let storage = Storage::with_settings(Ok(root.path().to_path_buf()), settings);
+        storage.open().await;
+        assert_eq!(storage.kind().await, "unavailable");
+        storage.close().await;
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("end of the read");
+        // Nothing of the migration is in the database, and the connection of
+        // the failed opening left no journal behind.
+        assert_eq!(applied_versions(&mut reader).await, vec![1]);
+        reader.close().await.expect("close");
+        assert_eq!(fs::read(&layout.database).expect("database"), before);
+        assert!(!layout.data_dir.join("atlas.db-journal").exists());
+        // The next start applies it.
         assert_eq!(session(&layout, TWO).await, (Access::ReadWrite, false, 1));
     });
 }
