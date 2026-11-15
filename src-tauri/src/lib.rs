@@ -7,6 +7,7 @@ mod commands;
 mod dto;
 mod events;
 mod modules;
+mod storage;
 
 use tauri::Manager;
 
@@ -14,6 +15,12 @@ use crate::app::{AppState, ExitStep};
 use crate::error::AppError;
 use crate::events::bus::{DEFAULT_CAPACITY, EventBus};
 use crate::events::ui_bridge::{self, WebviewSink};
+use crate::storage::Storage;
+
+/// How long the exit waits for the database to close. Provisional: the same
+/// bound as the module shutdown; the value is to be chosen after measuring
+/// the close on Windows (ADR-016).
+const STORAGE_CLOSE_TIMEOUT: std::time::Duration = modules::manager::SHUTDOWN_TIMEOUT;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,6 +39,12 @@ pub fn run() {
             };
             logging::install_panic_hook();
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "ATLAS starting");
+            // The storage opens the database in the background: `setup` neither
+            // waits for SQLite nor fails if the database is unavailable
+            // (ADR-016). Nothing uses the database yet.
+            let storage = Storage::new(app.path().app_local_data_dir().map_err(AppError::from));
+            tauri::async_runtime::spawn(storage.open());
+            app.manage(storage);
             let events = EventBus::new(DEFAULT_CAPACITY);
             // The bridge subscribes before the manager runs, so the UI is
             // sent every event from the first one (#11).
@@ -60,11 +73,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // Exit order (decision 28 in #13): stop the modules, wait for their stops
-    // and `StatusChanged` events (bounded by the shutdown timeout), close the
-    // event bus, flush the logs, exit. `App::run` ends the process with
-    // `std::process::exit`, so managed state is never dropped and each step is
-    // explicit.
+    // Exit order (decision 28 in #13, ADR-016): stop the modules, wait for
+    // their stops and `StatusChanged` events (bounded by the shutdown
+    // timeout), close the database, close the event bus, flush the logs, exit.
+    // `App::run` ends the process with `std::process::exit`, so managed state
+    // is never dropped and each step is explicit.
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { code, api, .. } => {
             let Some(state) = app_handle.try_state::<AppState>() else {
@@ -80,6 +93,10 @@ pub fn run() {
                     let handle = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = modules.shutdown().await;
+                        // After the modules: nothing writes any more.
+                        if let Some(storage) = handle.try_state::<Storage>() {
+                            storage.close_within(STORAGE_CLOSE_TIMEOUT).await;
+                        }
                         // Not if `RunEvent::Exit` has already begun: an exit
                         // requested then could end the process before the
                         // logs are flushed.
@@ -97,13 +114,20 @@ pub fn run() {
         }
         tauri::RunEvent::Exit => {
             tracing::info!("ATLAS exiting");
-            if let Some(state) = app_handle.try_state::<AppState>() {
-                if state.begin_exit() {
-                    // Exit without a completed stop (e.g. a restart, where the
-                    // exit cannot be prevented): stop the modules here, within
-                    // the same overall timeout.
-                    let _ = tauri::async_runtime::block_on(state.modules().shutdown());
-                }
+            let state = app_handle.try_state::<AppState>();
+            if let Some(state) = &state
+                && state.begin_exit()
+            {
+                // Exit without a completed stop (e.g. a restart, where the
+                // exit cannot be prevented): stop the modules here, within
+                // the same overall timeout.
+                let _ = tauri::async_runtime::block_on(state.modules().shutdown());
+            }
+            // Already closed on the normal path; then this does nothing.
+            if let Some(storage) = app_handle.try_state::<Storage>() {
+                tauri::async_runtime::block_on(storage.close_within(STORAGE_CLOSE_TIMEOUT));
+            }
+            if let Some(state) = &state {
                 state.close_events();
                 state.flush_logs();
             }

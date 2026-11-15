@@ -21,7 +21,7 @@ Implement only:
 - typed DTO;
 - structured logging;
 - module contract + registry, no real feature modules yet;
-- SQLite connection abstraction and one migration only after dependency setup is verified.
+- SQLite connection abstraction and the migration mechanism only after dependency setup is verified. The foundation has no application tables: the first application migration (`module_config`) belongs to MM-5B (#21).
 
 Out of scope: microphone, real LLM calls, Telegram, Windows automation, long-term memory, vector DB, arbitrary command execution.
 
@@ -54,6 +54,6 @@ Superseded by the agreed plan (tracking issue #13); one issue = one PR, strictly
 
 Notes:
 - The former "typed app status command" is covered by `list_modules` (#11).
-- The former "SQLite foundation and initial migration" will be a separate issue after #12; Stage 1 is not complete without it.
+- The former "SQLite foundation and initial migration" is split: the SQLite foundation (storage service, migration mechanism, no application tables; SQLite 3.54.1 and no checkpoint on close through a temporary local fork of `sqlx-sqlite` in `vendor/`, to be removed when an official sqlx release accepts a fixed `libsqlite3-sys`; ADR-016) is a separate task after #12, and the initial application migration (`module_config`) arrives with MM-5B (#21). Stage 1 is not complete without the foundation.
 
 Keep each issue small enough for one review.
