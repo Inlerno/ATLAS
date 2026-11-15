@@ -49,7 +49,29 @@
 - Предупреждения `proc-macro-error` (unmaintained) и `glib` (unsound) — из дерева Tauri, были и до этой задачи.
 
 ### Windows
-Автоматическая проверка — шаги Windows CI на реальном Windows-раннере GitHub (`windows-latest`, MSVC): `npm run build`, `cargo fmt --check`, `cargo clippy` и `cargo test` в обеих конфигурациях, `cargo doc`, `cargo test --release` в обеих конфигурациях, сборка на Rust 1.90.0. Шаги `cargo doc` и `cargo test --release` добавлены в этой задаче. Результаты запуска CI для PR — в описании PR.
+Автоматическая проверка — шаги Windows CI на реальном Windows-раннере GitHub (`windows-latest`, MSVC): `npm run build`, `cargo fmt --check`, `cargo clippy` и `cargo test` в обеих конфигурациях, `cargo doc`, `cargo test --release` в обеих конфигурациях, сборка на Rust 1.90.0. Шаги `cargo doc` и `cargo test --release` добавлены в этой задаче. Результаты для PR #25:
+
+| Запуск | Коммит ветки | Итог |
+|---|---|---|
+| [43730071909](https://github.com/Inlerno/ATLAS/actions/runs/43730071909) | `790a3bb` | **не прошёл:** 1 тест из 273 — `database_path_that_cannot_be_opened_is_unavailable`. На Windows открытие каталога вместо файла даёт расширенный код `SQLITE_CANTOPEN_ISDIR` (526), на Linux — 14. Хранилище в обоих случаях `Unavailable`; исправлено ожидание теста (сравнение по основному коду) |
+| [43730748410](https://github.com/Inlerno/ATLAS/actions/runs/43730748410) | `0050736` | **успешно**, все шаги |
+
+Запуск 43730748410 (образ `windows-2025-vs2026`, rustc 1.100.0, MSVC):
+
+| Шаг | Результат |
+|---|---|
+| `npm run build`, `cargo fmt --check` | OK |
+| `cargo clippy --locked --all-targets -- -D warnings` (и с `demo-modules`) | OK |
+| `cargo test --locked` | unit: 270 пройдено, 0 провалено, 3 пропущены; интеграционные 1 + 1 + 1 |
+| `cargo test --locked --features demo-modules` | unit: 279 пройдено, 3 пропущены |
+| `cargo doc --locked --no-deps` | OK |
+| `cargo test --locked --release` | unit: 270 пройдено, 3 пропущены |
+| `cargo test --locked --release --features demo-modules` | unit: 279 пройдено, 3 пропущены |
+| `cargo +1.90.0 build --locked` (обе конфигурации), rustc 1.90.0 | OK — **первая фактическая сборка на Rust 1.90**, включая `libsqlite3-sys 0.40.0` и форк `sqlx-sqlite` |
+
+На Windows на один unit-тест меньше, чем на Linux (270 против 271): тест прав файлов `write_protected_file_and_directory_give_read_only` существует только под `cfg(unix)`. Межпроцессные тесты замка первого запуска, тесты файлов WAL (включая побайтное сравнение базы и WAL после закрытия, уничтожения соединения, выхода и принудительного завершения процесса), тест флага `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` и тест версии SQLite прошли во всех четырёх запусках тестов. Три пропущенных теста — те же, что на Linux.
+
+CI собирает и проверяет merge-коммит PR, а не голову ветки. Установщик и запуск самого приложения в CI не выполняются.
 
 **Вручную на Windows не проверялось ничего** (ПК разработчика недоступен):
 - фактический путь `%LOCALAPPDATA%\com.inlerno.atlas`, профиль с именем не на латинице;
