@@ -20,3 +20,7 @@
 *.webp binary
 *.woff binary
 *.woff2 binary
+
+# The local fork of sqlx-sqlite is kept byte for byte as published (ADR-016):
+# its whitespace is not ours to fix, so `git diff --check` skips it.
+vendor/sqlx-sqlite/** -whitespace
