@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Manual Windows check of the ATLAS SQLite foundation (PR #25, ADR-016).
+    Manual Windows check of the ATLAS SQLite foundation (ADR-016, issue #26).
 
 .DESCRIPTION
     Runs the built ATLAS application through a set of storage scenarios and
@@ -15,11 +15,11 @@
       1. refuses to start while ATLAS is running or a previous run of this
          script was not restored;
       2. renames an existing data directory to
-         com.inlerno.atlas.pr25-backup-<timestamp> and verifies the rename;
+         com.inlerno.atlas.sqlite-check-backup-<timestamp> and verifies the rename;
       3. creates a fresh directory in its place and marks it with a sentinel
          file; every destructive step first checks that sentinel;
       4. in `finally` moves the test directory into the report (or, if that
-         is not possible, renames it to com.inlerno.atlas.pr25-test-<timestamp>)
+         is not possible, renames it to com.inlerno.atlas.sqlite-check-test-<timestamp>)
          and renames the backup back.
 
     The backup is never deleted and never overwritten by this script. If the
@@ -70,8 +70,8 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 
 $AppId = 'com.inlerno.atlas'
-$Sentinel = '.atlas-pr25-test-root'
-$BackupInfix = '.pr25-backup-'
+$Sentinel = '.atlas-sqlite-check-test-root'
+$BackupInfix = '.sqlite-check-backup-'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 # Windows PowerShell 5.1 has no $IsWindows; it only runs on Windows.
@@ -90,7 +90,7 @@ $Shm = Join-Path $DataDir 'atlas.db-shm'
 $Journal = Join-Path $DataDir 'atlas.db-journal'
 $Marker = Join-Path $Root 'storage.initialized'
 $LogDir = Join-Path $Root 'logs'
-$Report = Join-Path $HOME "atlas-pr25-check-$Stamp"
+$Report = Join-Path $HOME "atlas-sqlite-check-$Stamp"
 $Backup = "$Root$BackupInfix$Stamp"
 
 $script:Results = New-Object System.Collections.ArrayList
@@ -177,7 +177,7 @@ function Get-EntryCount([string]$Path) {
 
 function Write-RestoreInstructions([string]$Why) {
     $text = @(
-        'ATLAS PR #25 check: the data directory was NOT restored automatically.',
+        'ATLAS SQLite foundation check: the data directory was NOT restored automatically.',
         "Reason: $Why",
         '',
         "Data directory of ATLAS:      $Root",
@@ -285,7 +285,7 @@ function Exit-Isolation {
             Write-Note "Test directory moved to $target"
         } catch {
             # For example the report is on another drive. A rename in place needs no copy.
-            $aside = "$Root.pr25-test-$Stamp"
+            $aside = "$Root.sqlite-check-test-$Stamp"
             try {
                 if (Test-Path -LiteralPath $aside) { throw "$aside already exists" }
                 if (-not (Test-IsTestRoot)) { throw 'the test directory is no longer whole' }
@@ -473,6 +473,8 @@ function Find-Python {
 if (-not $Exe) { $Exe = Join-Path $RepoRoot 'src-tauri\target\release\atlas.exe' }
 if (-not $OnWindows) { $Exe = $Exe -replace '\\', '/' -replace '\.exe$', '' }
 
+# Two runs in the same second must not share a report directory.
+for ($n = 2; Test-Path -LiteralPath $Report; $n++) { $Report = Join-Path $HOME "atlas-sqlite-check-$Stamp-$n" }
 New-Item -ItemType Directory -Path $Report -ErrorAction Stop | Out-Null
 Write-Note "Report directory: $Report"
 Write-Note "Data directory of ATLAS: $Root"
@@ -804,7 +806,7 @@ try {
 # ---------------------------------------------------------------------------
 
 $summary = New-Object System.Collections.ArrayList
-[void]$summary.Add('ATLAS SQLite foundation check (PR #25)')
+[void]$summary.Add('ATLAS SQLite foundation check (issue #26)')
 [void]$summary.Add("report:        $Report")
 [void]$summary.Add("data dir:      $Root")
 [void]$summary.Add("SQLite in log: $($script:SqliteVersion)")
