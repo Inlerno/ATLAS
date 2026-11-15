@@ -102,3 +102,31 @@ jobs:
       - name: cargo test (demo-modules)
         working-directory: src-tauri
         run: cargo test --locked --features demo-modules
+
+      - name: cargo doc
+        working-directory: src-tauri
+        run: cargo doc --locked --no-deps
+
+      # The release profile is what users run: the storage tests (ADR-016) compare
+      # database files byte for byte and start helper processes, so they are run
+      # in it too, on Windows itself.
+      - name: cargo test --release
+        working-directory: src-tauri
+        run: cargo test --locked --release
+
+      - name: cargo test --release (demo-modules)
+        working-directory: src-tauri
+        run: cargo test --locked --release --features demo-modules
+
+      # The declared minimum (`rust-version = "1.90"` in Cargo.toml). sqlx 0.8.x
+      # declares no `rust-version` of its own, so cargo cannot refuse an
+      # incompatible compiler: only a build on 1.90 itself shows it (ADR-016).
+      # The steps above keep using `stable`.
+      - name: cargo build (Rust 1.90.0, the declared minimum)
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          cargo +1.90.0 --version
+          cargo +1.90.0 build --locked
+          cargo +1.90.0 build --locked --features demo-modules
