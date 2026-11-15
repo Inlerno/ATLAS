@@ -1681,8 +1681,15 @@ fn database_path_that_cannot_be_opened_is_unavailable() {
         fs::create_dir_all(&layout.database).expect("directory");
         fs::write(&layout.marker, b"").expect("marker");
         let error = reason(open(&layout, ONE).await);
-        // SQLITE_CANTOPEN.
-        assert!(error.starts_with("step=open code=14 "), "{error}");
+        // SQLITE_CANTOPEN (14). The extended code depends on the platform:
+        // plain 14 on Linux, SQLITE_CANTOPEN_ISDIR (526) on Windows; either
+        // way the storage is unavailable and the journal has the full code.
+        let code: i32 = error
+            .strip_prefix("step=open code=")
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no code in: {error}"));
+        assert_eq!(code & 0xff, 14, "{error}");
         assert!(layout.database.is_dir());
     });
 }
