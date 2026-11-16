@@ -146,10 +146,8 @@ jobs:
         include:
           - name: Windows PowerShell 5.1
             shell: powershell
-            exe: powershell.exe
           - name: PowerShell 7
             shell: pwsh
-            exe: pwsh.exe
 
     steps:
       - name: Checkout
@@ -157,17 +155,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Show environment
-        shell: ${{ matrix.shell }}
+      # `shell` takes no expression, so each shell has a step of its own and the
+      # matrix chooses one. The tests run in a child process with explicit
+      # flags, the way a user starts them. The test file prints the number of
+      # cases, checks and failed checks and ends with a non-zero exit code when
+      # any check failed.
+      - name: Tests in Windows PowerShell 5.1
+        if: matrix.shell == 'powershell'
+        shell: powershell
         run: |
           git log -1 --format='%H %P %s'
           $PSVersionTable | Out-String
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
+          exit $LASTEXITCODE
 
-      # A child process with explicit flags, the same way a user starts it. The
-      # test file prints the number of cases, checks and failed checks and ends
-      # with a non-zero exit code when any check failed.
-      - name: sqlite-foundation-check.tests.ps1
-        shell: ${{ matrix.shell }}
+      - name: Tests in PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: |
-          & ${{ matrix.exe }} -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
+          git log -1 --format='%H %P %s'
+          $PSVersionTable | Out-String
+          & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
           exit $LASTEXITCODE
