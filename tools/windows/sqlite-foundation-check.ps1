@@ -110,7 +110,15 @@
 
 .PARAMETER Source
     A copy of the ATLAS repository, only for -Build. Default: the current
-    directory, if it is one.
+    directory, if it is one. A directory counts as ATLAS only when all of
+    this holds: package.json is valid JSON with "name": "atlas" and a
+    "build" script; src-tauri\Cargo.toml has name = "atlas" in [package] and
+    name = "atlas_lib" in [lib]; src-tauri\tauri.conf.json is valid JSON
+    with "identifier": "com.inlerno.atlas" (the application whose data
+    directory this script isolates) and "productName": "ATLAS". Anything
+    missing, unreadable or different: the script refuses, with the reason,
+    before anything is installed, built or changed. This catches a wrong
+    folder, not a forged one.
 
 .PARAMETER Build
     Build the application from -Source first: npm ci, npm run build, cargo
@@ -129,21 +137,36 @@
 
 .PARAMETER SelfTest
     Run the tests of this script and nothing else. Every case works in a
-    temporary directory of its own through -TestBase: ATLAS is not started
-    and %LOCALAPPDATA% is not touched. Exit code 0 when every check passed.
+    temporary directory of its own: ATLAS is not started and %LOCALAPPDATA%
+    is not touched. To prove that, everything named com.inlerno.atlas* in
+    the real %LOCALAPPDATA% is recorded before and after the tests, object
+    by object: the type and the relative path of each, and the size and
+    the SHA-256 of every file; junctions and symbolic links are recorded
+    and not followed. If ATLAS is running the tests are not started: close
+    ATLAS and try again. If the record cannot be taken completely (a file
+    cannot be read, a directory cannot be listed, a path is too long for
+    Windows PowerShell 5.1) the tests fail instead of passing over it.
+    Exit codes: 0 every check passed; 1 a check failed; 2 the tests were
+    not started.
 
 .PARAMETER Keep
     Only with -SelfTest: keep the temporary directories for inspection.
 
 .PARAMETER TestBase
-    Only for the tests of this script (-SelfTest). An
-    existing directory that stands in for the profile: <TestBase>\local
-    replaces %LOCALAPPDATA% and <TestBase>\home receives the report. With it
-    the application is never started and no scenario runs: only the backup
-    and restore steps are exercised.
+    Only with -SelfTest, for the tests of this script. An existing directory
+    that stands in for the profile: <TestBase>\local replaces %LOCALAPPDATA%
+    and <TestBase>\home receives the report; the real %LOCALAPPDATA% is not
+    read. -SelfTest -TestBase alone makes the guard of the test suite check
+    itself against that test profile and runs no test case.
+
+.PARAMETER TestRun
+    Only with -SelfTest -TestBase: run the script itself against the test
+    profile, as the test cases do. The application is never started and no
+    scenario runs: only the backup and restore steps are exercised.
 
 .PARAMETER TestFault
-    Only with -TestBase: comma separated names of steps that must fail.
+    Only with -SelfTest -TestBase: comma separated names of steps that must
+    fail.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\sqlite-foundation-check.ps1 -SelfTest
@@ -168,1254 +191,12 @@ param(
     [string]$TestFault,
     [string]$Source,
     [switch]$SelfTest,
-    [switch]$Keep
+    [switch]$Keep,
+    [switch]$TestRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-if ($Keep -and -not $SelfTest) { throw '-Keep is only for -SelfTest. Nothing was changed.' }
-
-# ---------------------------------------------------------------------------
-# -SelfTest: the tests of this script
-# ---------------------------------------------------------------------------
-# Every case builds a profile of its own in a temporary directory and runs
-# this file against it with -TestBase. With -TestBase the script never
-# starts ATLAS and never looks at %LOCALAPPDATA%, so the tests do not touch
-# any real data. Faults are injected with -TestFault.
-
-if ($SelfTest) {
-    if ($Exe -or $Build -or $RestoreOnly -or $TestBase -or $TestFault -or $Source) {
-        throw '-SelfTest takes no other parameter than -Keep. Nothing was changed.'
-    }
-    # The tests run this very file as a child process.
-    $Script = $PSCommandPath
-    $Shell = (Get-Process -Id $PID).Path
-    $OnWindows = ($PSVersionTable.PSEdition -ne 'Core') -or $IsWindows
-    $AppId = 'com.inlerno.atlas'
-    $SentinelName = '.atlas-sqlite-check-test-root'
-    # Kept short: Windows PowerShell 5.1 cannot go beyond 260 characters, and the
-    # backup directories of the script carry a time and a 32 digit run id.
-    $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("asct-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    New-Item -ItemType Directory -Path $Work | Out-Null
-
-    # What the tests must leave alone: the real profile and the real ATLAS.
-    function Get-RealProfileState {
-        $real = [Environment]::GetFolderPath('LocalApplicationData')
-        if (-not $real -or -not (Test-Path -LiteralPath $real)) { return 'no profile' }
-        $lines = @()
-        foreach ($entry in @(Get-ChildItem -LiteralPath $real -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name.StartsWith($AppId) } | Sort-Object Name)) {
-            $lines += "$($entry.Name)|$($entry.LastWriteTimeUtc.Ticks)"
-            if ($entry.PSIsContainer) {
-                foreach ($child in @(Get-ChildItem -LiteralPath $entry.FullName -Force -ErrorAction SilentlyContinue | Sort-Object Name)) { $lines += "  $($child.Name)|$($child.LastWriteTimeUtc.Ticks)" }
-            }
-        }
-        return ($lines -join "`n")
-    }
-    function Test-SamePathForTest([string]$Left, [string]$Right) { return ("$Left".TrimEnd('\', '/') -ieq "$Right".TrimEnd('\', '/')) }
-    function Get-AtlasProcessIds { return @(Get-Process -Name 'atlas' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) }
-    $realProfileBefore = Get-RealProfileState
-    $atlasBefore = @(Get-AtlasProcessIds)
-
-    $script:Failures = New-Object System.Collections.ArrayList
-    $script:Checks = 0
-    $script:Case = ''
-    $script:CaseFailed = $false
-    $script:Cases = New-Object System.Collections.ArrayList
-
-    function Check([bool]$Condition, [string]$What) {
-        $script:Checks++
-        if (-not $Condition) {
-            $script:CaseFailed = $true
-            [void]$script:Failures.Add("$($script:Case): $What")
-            Write-Host "    FAILED: $What" -ForegroundColor Red
-        }
-    }
-
-    function Start-Case([string]$Name) {
-        Stop-Case
-        $script:Case = $Name
-        $script:CaseFailed = $false
-    }
-
-    function Stop-Case {
-        if ($script:Case) {
-            $status = 'ok'
-            if ($script:CaseFailed) { $status = 'FAILED' }
-            [void]$script:Cases.Add("$status  $($script:Case)")
-            Write-Host ("{0,-7} {1}" -f $status, $script:Case)
-            $script:Case = ''
-        }
-    }
-
-    # Names and CONTENTS of everything below a directory.
-    function Get-Snapshot([string]$Directory) {
-        if (-not (Test-Path -LiteralPath $Directory)) { return '<absent>' }
-        $base = (Get-Item -LiteralPath $Directory -Force).FullName.TrimEnd('\', '/')
-        $lines = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($item in @(Get-ChildItem -LiteralPath $base -Recurse -Force)) {
-            $relative = $item.FullName.Substring($base.Length + 1).Replace('\', '/')
-            if ($item.PSIsContainer) { $lines.Add("d|$relative") }
-            else { $lines.Add("f|$relative|$((Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash)") }
-        }
-        $lines.Sort([System.StringComparer]::Ordinal)
-        return ($lines.ToArray() -join "`n")
-    }
-
-    # A profile with (or without) a data directory that stands for the user's.
-    function New-Base([string]$Name, [bool]$WithOriginal = $true) {
-        $base = Join-Path $Work $Name
-        New-Item -ItemType Directory -Path (Join-Path $base 'local') -Force | Out-Null
-        New-Item -ItemType Directory -Path (Join-Path $base 'home') -Force | Out-Null
-        if ($WithOriginal) {
-            $root = Join-Path (Join-Path $base 'local') $AppId
-            New-Item -ItemType Directory -Path (Join-Path $root 'data') -Force | Out-Null
-            New-Item -ItemType Directory -Path (Join-Path $root 'logs') -Force | Out-Null
-            New-Item -ItemType Directory -Path (Join-Path (Join-Path $root 'EBWebView') 'Default') -Force | Out-Null
-            [System.IO.File]::WriteAllText((Join-Path (Join-Path $root 'data') 'atlas.db'), 'USER DATABASE - must never change')
-            [System.IO.File]::WriteAllText((Join-Path $root 'storage.initialized'), 'marker')
-            [System.IO.File]::WriteAllText((Join-Path (Join-Path $root 'logs') 'atlas.2026-11-01.log'), 'old log')
-            [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $root 'EBWebView') 'Default') 'Cookies'), 'cookies')
-            # A name that is not ASCII (U+0416 U+0443 U+0440).
-            $cyrillic = ([string][char]0x0416) + ([string][char]0x0443) + ([string][char]0x0440) + '.txt'
-            [System.IO.File]::WriteAllText((Join-Path $root $cyrillic), 'note')
-        }
-        return $base
-    }
-
-    function Get-Root([string]$Base) { return (Join-Path (Join-Path $Base 'local') $AppId) }
-    function Get-Local([string]$Base) { return (Join-Path $Base 'local') }
-    function Get-StateDir([string]$Base) { return (Join-Path (Join-Path $Base 'local') "$AppId.sqlite-check") }
-
-    function Get-Backups([string]$Base) {
-        return @(Get-ChildItem -LiteralPath (Get-Local $Base) -Directory -Force |
-            Where-Object { $_.Name.StartsWith("$AppId.sqlite-check-backup-") })
-    }
-
-    function Get-Manifests([string]$Base) {
-        $state = Get-StateDir $Base
-        if (-not (Test-Path -LiteralPath $state)) { return @() }
-        return @(Get-ChildItem -LiteralPath $state -File -Filter 'manifest-*.txt')
-    }
-
-    function Test-IsTestDir([string]$Directory) {
-        return (Test-Path -LiteralPath (Join-Path $Directory $SentinelName) -PathType Leaf)
-    }
-
-    # Runs the script; returns its exit code. The output goes to a file.
-    function Invoke-Check([string]$Base, [string[]]$Arguments) {
-        $script:RunNumber++
-        $log = Join-Path $Base ("run-{0:d2}.txt" -f $script:RunNumber)
-        $all = @('-NoLogo', '-NoProfile')
-        if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
-        $all += @('-File', $Script, '-TestBase', $Base) + $Arguments
-        $code = Invoke-Shell $all $log
-        $script:LastLog = $log
-        return $code
-    }
-
-    # Runs the shell and writes everything it prints to a file, one line of the
-    # child per line of the file. Not `*> file`: Windows PowerShell 5.1 would
-    # wrap long lines at the width of the console and turn what the child writes
-    # to its error stream into terminating errors.
-    function Invoke-Shell([string[]]$All, [string]$Log) {
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try {
-            $lines = @(& $Shell @All 2>&1 | ForEach-Object { "$_" })
-            $code = $LASTEXITCODE
-        } finally { $ErrorActionPreference = $previous }
-        [System.IO.File]::WriteAllLines($Log, [string[]]$lines)
-        return $code
-    }
-    $script:RunNumber = 0
-    $script:LastLog = ''
-
-    function Get-LastOutput { return ([System.IO.File]::ReadAllText($script:LastLog)) }
-
-    # An interrupted run: the process ends right after the isolation, no `finally`.
-    function New-InterruptedBase([string]$Name, [bool]$WithOriginal = $true) {
-        $base = New-Base $Name $WithOriginal
-        $code = Invoke-Check $base @('-TestFault', 'crash-after-isolation')
-        Check ($code -eq 99) "setup: the interrupted run must end with 99, got $code"
-        return $base
-    }
-
-    # ---------------------------------------------------------------------------
-    # Normal runs
-    # ---------------------------------------------------------------------------
-
-    Start-Case 'normal run: the original comes back unchanged'
-    $base = New-Base 'normal'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
-    Check (-not (Test-IsTestDir (Get-Root $base))) 'the data path does not hold a test directory'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-    Check (@(Get-Manifests $base).Count -eq 1) 'the manifest is kept'
-    Check ((Get-LastOutput) -match 'original path restored:\s+yes') 'the outcome says the path is restored'
-    Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Force -Filter $SentinelName).Count -eq 1) 'the test directory is in the report'
-
-    Start-Case 'normal run twice: the manifest of the first run is not overwritten'
-    $first = (Get-Manifests $base)[0]
-    $firstHash = (Get-FileHash -LiteralPath $first.FullName -Algorithm SHA256).Hash
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check (@(Get-Manifests $base).Count -eq 2) 'two manifests exist'
-    Check ((Get-FileHash -LiteralPath $first.FullName -Algorithm SHA256).Hash -eq $firstHash) 'the first manifest is unchanged'
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
-
-    Start-Case 'normal run without a data directory: nothing is left in the data path'
-    $base = New-Base 'no-original' $false
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty again'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory'
-
-    Start-Case 'a failing scenario: the original comes back'
-    $base = New-Base 'scenario-fault'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'scenario')
-    Check ($code -eq 1) "exit code 1, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-
-    # ---------------------------------------------------------------------------
-    # A step of Enter-Isolation fails
-    # ---------------------------------------------------------------------------
-
-    foreach ($fault in @(
-            @{ Name = 'manifest-write'; Code = 2; Moved = $false },
-            @{ Name = 'stage-create'; Code = 1; Moved = $false },
-            @{ Name = 'sentinel-write'; Code = 1; Moved = $false },
-            @{ Name = 'backup-rename'; Code = 1; Moved = $false },
-            @{ Name = 'backup-verify'; Code = 1; Moved = $true },
-            @{ Name = 'stage-move'; Code = 1; Moved = $true })) {
-        Start-Case "fault '$($fault.Name)': the original is in its place afterwards"
-        $base = New-Base "fault-$($fault.Name)"
-        $before = Get-Snapshot (Get-Root $base)
-        $code = Invoke-Check $base @('-TestFault', $fault.Name)
-        Check ($code -eq $fault.Code) "exit code $($fault.Code), got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged and in its place'
-        Check (-not (Test-IsTestDir (Get-Root $base))) 'the data path does not hold a test directory'
-        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-        $output = Get-LastOutput
-        Check ($output -match 'original path restored:\s+yes') 'the outcome says where the original is'
-        Check ($output -match 'test copy:') 'the outcome says where the test copy is'
-        Check ($output -match 'manual steps:\s+none') 'no manual step is asked for'
-        $again = Invoke-Check $base @('-RestoreOnly')
-        Check ($again -eq 0) "-RestoreOnly afterwards: exit code 0, got $again"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) '-RestoreOnly afterwards changes nothing'
-    }
-
-    Start-Case "fault 'sentinel-write' without a data directory: no unmarked directory in the data path"
-    $base = New-Base 'fault-sentinel-no-original' $false
-    $code = Invoke-Check $base @('-TestFault', 'sentinel-write')
-    Check ($code -eq 1) "exit code 1, got $code"
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path stays empty'
-
-    # ---------------------------------------------------------------------------
-    # A step of the restore fails
-    # ---------------------------------------------------------------------------
-
-    Start-Case "fault 'test-root-move': the test directory is renamed aside, the original comes back"
-    $base = New-Base 'fault-test-root-move'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'test-root-move')
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
-    $aside = @(Get-ChildItem -LiteralPath (Get-Local $base) -Directory -Force | Where-Object { $_.Name.EndsWith('-aside') })
-    Check ($aside.Count -eq 1 -and (Test-IsTestDir $aside[0].FullName)) 'the test directory lies aside with its sentinel'
-
-    Start-Case 'the test directory cannot be moved at all: stop, backup intact, then -RestoreOnly'
-    $base = New-Base 'fault-test-root-stuck'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'test-root-move,test-root-aside')
-    Check ($code -eq 3) "exit code 3, got $code"
-    $backups = @(Get-Backups $base)
-    Check ($backups.Count -eq 1) 'exactly one backup directory'
-    if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
-    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is still in the data path'
-    $output = Get-LastOutput
-    Check ($output -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
-    Check ($output -match 'manual steps:\s+see ') 'the outcome points at the instructions'
-    Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt').Count -ge 1) 'the instructions are written'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) '-RestoreOnly brings the original back unchanged'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the second -RestoreOnly changes nothing'
-
-    Start-Case "fault 'backup-restore': stop, backup intact, then -RestoreOnly"
-    $base = New-Base 'fault-backup-restore'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'backup-restore')
-    Check ($code -eq 3) "exit code 3, got $code"
-    $backups = @(Get-Backups $base)
-    Check ($backups.Count -eq 1) 'exactly one backup directory'
-    if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty (the test directory was moved away)'
-    Check ((Get-LastOutput) -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'backup-restore')
-    Check ($code -eq 3) "-RestoreOnly that fails too: exit code 3, got $code"
-    $backups = @(Get-Backups $base)
-    Check ($backups.Count -eq 1 -and (Get-Snapshot $backups[0].FullName) -eq $before) 'the backup is still intact'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
-
-    # ---------------------------------------------------------------------------
-    # Interrupted runs and -RestoreOnly
-    # ---------------------------------------------------------------------------
-
-    Start-Case 'interrupted after the isolation: a new run refuses, -RestoreOnly restores, twice is safe'
-    $base = New-Base 'interrupted'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'crash-after-isolation')
-    Check ($code -eq 99) "the interrupted run ends with 99, got $code"
-    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is in the data path'
-    Check (@(Get-Backups $base).Count -eq 1) 'one backup directory'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @()
-    Check ($code -eq 3) "a new run refuses with 3 (the data is not in its place), got $code"
-    Check ((Get-LastOutput) -match 'run the script with -RestoreOnly') 'the refusal points at -RestoreOnly'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved nothing'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is unchanged after it'
-
-    Start-Case 'interrupted right after the rename: only a backup exists, -RestoreOnly restores'
-    $base = New-Base 'only-backup'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'crash-after-backup')
-    Check ($code -eq 99) "the interrupted run ends with 99, got $code"
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty'
-    Check (@(Get-Backups $base).Count -eq 1) 'one backup directory'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
-
-    Start-Case 'only a test directory (there was no data directory): -RestoreOnly moves it away'
-    $base = New-InterruptedBase 'only-test-root' $false
-    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is in the data path'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty again'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
-
-    Start-Case 'only a test directory, but its manifest names a backup that is gone: stop'
-    $base = New-InterruptedBase 'test-root-backup-gone'
-    $elsewhere = Join-Path $base 'moved-by-the-test'
-    Move-Item -LiteralPath (Get-Backups $base)[0].FullName -Destination $elsewhere
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'no backup directory is there') 'the reason is named'
-
-    Start-Case 'backup and test directory from different runs: stop, nothing moved'
-    $base = New-InterruptedBase 'different-runs'
-    $sentinel = Join-Path (Get-Root $base) $SentinelName
-    $other = [guid]::NewGuid().ToString('N')
-    [System.IO.File]::WriteAllLines($sentinel, @('Test directory', "run_id=$other"))
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'different runs') 'the reason is named'
-
-    Start-Case 'the sentinel of the test directory is damaged: stop, nothing moved'
-    $base = New-InterruptedBase 'damaged-sentinel'
-    [System.IO.File]::WriteAllText((Join-Path (Get-Root $base) $SentinelName), 'garbage')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-
-    Start-Case 'several backups: stop, nothing moved, no guess'
-    $base = New-InterruptedBase 'several-backups'
-    $second = Join-Path (Get-Local $base) "$AppId.sqlite-check-backup-20260101-000000-$([guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Path $second | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $second 'file'), 'another backup')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'more than one backup') 'the reason is named'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 3) "a normal run refuses with 3 (the data is not in its place), got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
-
-    Start-Case 'the manifest is missing: stop; put back: restore'
-    $base = New-InterruptedBase 'manifest-missing'
-    $manifest = (Get-Manifests $base)[0].FullName
-    $kept = Join-Path $base 'manifest-kept-by-the-test.txt'
-    Move-Item -LiteralPath $manifest -Destination $kept
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'is missing') 'the reason is named'
-    Move-Item -LiteralPath $kept -Destination $manifest
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "with the manifest back: exit code 0, got $code"
-    Check (-not (Test-IsTestDir (Get-Root $base)) -and (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'))) 'the original is back'
-
-    Start-Case 'the manifest is damaged: stop, nothing moved'
-    $base = New-InterruptedBase 'manifest-damaged'
-    $manifest = (Get-Manifests $base)[0].FullName
-    $text = [System.IO.File]::ReadAllText($manifest)
-    [System.IO.File]::WriteAllText($manifest, ($text -replace 'entries=\d+', 'entries=1'))
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'damaged') 'the reason is named'
-
-    Start-Case 'the manifest is cut short: stop, nothing moved'
-    $base = New-InterruptedBase 'manifest-truncated'
-    $manifest = (Get-Manifests $base)[0].FullName
-    [System.IO.File]::WriteAllText($manifest, 'format=1')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-
-    Start-Case 'the backup no longer matches its manifest: stop; when it matches again: restore'
-    $base = New-InterruptedBase 'backup-changed'
-    $extra = Join-Path (Get-Backups $base)[0].FullName 'added-by-the-test.txt'
-    [System.IO.File]::WriteAllText($extra, 'x')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'does not match the fingerprint') 'the reason is named'
-    Remove-Item -LiteralPath $extra
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "when it matches again: exit code 0, got $code"
-
-    Start-Case 'the data path is occupied by a directory without a sentinel: stop, nothing moved'
-    $base = New-InterruptedBase 'occupied'
-    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'it may be data') 'the reason is named'
-
-    Start-Case 'a backup made by an older version of the script (no run id): stop, nothing moved'
-    $base = New-Base 'old-backup' $false
-    $old = Join-Path (Get-Local $base) "$AppId.sqlite-check-backup-20261115-190917"
-    New-Item -ItemType Directory -Path $old | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $old 'file'), 'data')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 3) "a normal run refuses with 3 (the data is not in its place), got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
-
-    Start-Case '-RestoreOnly with nothing to restore: exit 0, nothing moved'
-    $base = New-Base 'nothing-to-restore'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-
-    # ---------------------------------------------------------------------------
-    # Processes
-    # ---------------------------------------------------------------------------
-
-    function Set-Processes([string]$Base, [string[]]$Lines) {
-        [System.IO.File]::WriteAllLines((Join-Path $Base 'processes.txt'), $Lines)
-    }
-
-    foreach ($entry in @(
-            @{ Name = 'ATLAS is running'; Lines = @('100|atlas.exe|C:\x\atlas.exe'); Pattern = 'ATLAS is running' },
-            @{ Name = 'the installed ATLAS.exe is running'; Lines = @('100|ATLAS.exe|C:\Program Files\ATLAS\ATLAS.exe'); Pattern = 'ATLAS is running' },
-            @{ Name = 'a WebView2 process of ATLAS (by the executable name) is left'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe'); Pattern = 'WebView2 processes of ATLAS' },
-            @{ Name = 'a WebView2 process with an unreadable command line'; Lines = @('300|msedgewebview2.exe|<unreadable>'); Pattern = 'cannot be told whose' })) {
-        Start-Case "processes: $($entry.Name) -> refuse before any change"
-        $base = New-Base ("proc-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        Set-Processes $base $entry.Lines
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @()
-        Check ($code -eq 2) "exit code 2, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-        Check ((Get-LastOutput) -match $entry.Pattern) 'the reason is named'
-    }
-
-    Start-Case 'processes: a WebView2 process that names the data directory -> refuse'
-    $base = New-Base 'proc-by-directory'
-    Set-Processes $base @("200|msedgewebview2.exe|msedgewebview2.exe --user-data-dir=`"$(Get-Root $base)\EBWebView`" --type=gpu-process")
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @()
-    Check ($code -eq 2) "exit code 2, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    Start-Case 'processes: WebView2 of another application and unrelated processes -> the run goes on'
-    $base = New-Base 'proc-foreign'
-    $before = Get-Snapshot (Get-Root $base)
-    Set-Processes $base @(
-        '400|msedgewebview2.exe|msedgewebview2.exe --webview-exe-name=Teams.exe --user-data-dir="C:\Users\u\AppData\Local\Teams\EBWebView"',
-        '401|explorer.exe|C:\Windows\explorer.exe',
-        '402|atlas-helper.exe|C:\other\atlas-helper.exe')
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
-
-    Start-Case 'processes: ATLAS is running during -RestoreOnly -> stop, nothing moved; afterwards restore'
-    $base = New-InterruptedBase 'proc-restore'
-    Set-Processes $base @('100|atlas.exe|C:\x\atlas.exe')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Remove-Item -LiteralPath (Join-Path $base 'processes.txt')
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "after ATLAS was closed: exit code 0, got $code"
-
-    # ---------------------------------------------------------------------------
-    # Processes that are still there when the run wants to restore
-    # ---------------------------------------------------------------------------
-
-    # processes-after-scenario.txt becomes the process list once the (imitated)
-    # scenario has run: what a run of the application can leave behind.
-    foreach ($entry in @(
-            @{ Name = 'a WebView2 process with an unreadable command line stays'; Lines = @('300|msedgewebview2.exe|<unreadable>'); Pattern = 'owner unknown' },
-            @{ Name = 'a WebView2 process of ATLAS stays'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe'); Pattern = 'msedgewebview2\.exe \(id 200\)' },
-            @{ Name = 'the application itself stays'; Lines = @('100|atlas.exe|C:\x\atlas.exe'); Pattern = 'atlas\.exe \(id 100\)' },
-            @{ Name = 'the process list cannot be read'; Lines = @('!error'); Pattern = 'list of processes cannot be read' })) {
-        Start-Case "after the scenario $($entry.Name): nothing is moved, exit 3; -RestoreOnly restores once it is gone"
-        $base = New-Base ("after-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        $before = Get-Snapshot (Get-Root $base)
-        [System.IO.File]::WriteAllLines((Join-Path $base 'processes-after-scenario.txt'), $entry.Lines)
-        $code = Invoke-Check $base @()
-        Check ($code -eq 3) "exit code 3, got $code"
-        $output = Get-LastOutput
-        Check ($output -match 'cannot be confirmed that every ATLAS and WebView2 process has ended') 'the end of ATLAS is reported as not confirmed'
-        Check ($output -match $entry.Pattern) 'what is still running is named'
-        Check ($output -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
-        Check ($output -notmatch 'Test directory moved|Original data directory restored') 'nothing was moved or restored'
-        Check (Test-IsTestDir (Get-Root $base)) 'the test directory is still in the data path'
-        $backups = @(Get-Backups $base)
-        Check ($backups.Count -eq 1) 'exactly one backup directory'
-        if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
-        Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Force -Filter $SentinelName).Count -eq 0) 'no test directory was taken into the report'
-        Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt').Count -ge 1) 'the instructions are written'
-        # Still there: -RestoreOnly must not move anything either.
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 3) "-RestoreOnly while it is still there: exit code 3, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly while it is still there moved nothing'
-        # Gone.
-        Remove-Item -LiteralPath (Join-Path $base 'processes.txt') -Force
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "-RestoreOnly after it is gone: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
-        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved nothing'
-    }
-
-    Start-Case 'the process list cannot be read during -RestoreOnly: stop, nothing moved; afterwards restore'
-    $base = New-InterruptedBase 'proc-list-error'
-    Set-Processes $base @('!error')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    Check ((Get-LastOutput) -match 'list of processes cannot be read') 'the reason is named'
-    Remove-Item -LiteralPath (Join-Path $base 'processes.txt') -Force
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "afterwards: exit code 0, got $code"
-
-    Start-Case 'the process list cannot be read before the run: refuse before any change'
-    $base = New-Base 'proc-list-error-start'
-    Set-Processes $base @('!error')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @()
-    Check ($code -eq 2) "exit code 2, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    # ---------------------------------------------------------------------------
-    # The backups cannot be listed
-    # ---------------------------------------------------------------------------
-
-    Start-Case 'the backups cannot be listed during -RestoreOnly: a refusal, not "nothing to restore"'
-    $base = New-InterruptedBase 'list-error-restore'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'list-backups')
-    Check ($code -eq 3) "exit code 3, got $code"
-    $output = Get-LastOutput
-    Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-    Check ($output -match 'cannot be listed') 'the reason is named'
-    Check ($output -match 'original path restored:\s+NO') 'the outcome does not claim the data is in place'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "once the listing works: exit code 0, got $code"
-    Check (-not (Test-IsTestDir (Get-Root $base)) -and @(Get-Backups $base).Count -eq 0) 'the original is back'
-
-    Start-Case 'the backups cannot be listed and there is nothing to restore: still a refusal'
-    $base = New-Base 'list-error-clean'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'list-backups')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-
-    Start-Case 'the backups cannot be listed before a run: refuse, nothing changed, no claim that the data is in place'
-    $base = New-Base 'list-error-start'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-TestFault', 'list-backups')
-    Check ($code -eq 3) "exit code 3 (the state could not be checked), got $code"
-    $output = Get-LastOutput
-    Check ($output -match 'cannot be listed') 'the reason is named'
-    Check ($output -match 'original path restored:\s+NO') 'the outcome does not claim the data is in place'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    # ---------------------------------------------------------------------------
-    # The backup changes between its first check and the restore
-    # ---------------------------------------------------------------------------
-
-    Start-Case 'the backup changes during the run: the restore stops before the backup is moved; then -RestoreOnly'
-    $base = New-Base 'tamper-run'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'tamper-backup')
-    Check ($code -eq 3) "exit code 3, got $code"
-    $output = Get-LastOutput
-    Check ($output -match 'does not match the fingerprint') 'the reason is named'
-    Check ($output -match 'it was not moved') 'it says the backup was not moved'
-    Check ($output -notmatch 'Original data directory restored') 'nothing was restored'
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is not occupied'
-    $backups = @(Get-Backups $base)
-    Check ($backups.Count -eq 1) 'the backup is where it was'
-    if ($backups.Count -eq 1) {
-        $added = Join-Path $backups[0].FullName 'added-by-the-fault.txt'
-        Check (Test-Path -LiteralPath $added) 'the change is in the backup'
-        # Still changed: -RestoreOnly refuses too.
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 3) "-RestoreOnly while it is changed: exit code 3, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly while it is changed moved nothing'
-        Remove-Item -LiteralPath $added -Force
-        Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'without the change the backup holds the original data'
-    }
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly after the change is undone: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
-
-    Start-Case 'the backup changes between the check of -RestoreOnly and its rename: stop before the move'
-    $base = New-InterruptedBase 'tamper-restore'
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'tamper-backup')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-LastOutput) -match 'it was not moved') 'it says the backup was not moved'
-    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is not occupied by the backup'
-    $backups = @(Get-Backups $base)
-    Check ($backups.Count -eq 1) 'the backup is where it was'
-    if ($backups.Count -eq 1) { Remove-Item -LiteralPath (Join-Path $backups[0].FullName 'added-by-the-fault.txt') -Force }
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly after the change is undone: exit code 0, got $code"
-    Check ((Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db')) -and @(Get-Backups $base).Count -eq 0) 'the original is back'
-
-    # ---------------------------------------------------------------------------
-    # Group A: the sentinel of the installed test directory is lost
-    # ---------------------------------------------------------------------------
-
-    function Get-RunIds([string]$Base) {
-        return @(Get-Manifests $Base | ForEach-Object { $_.BaseName.Substring('manifest-'.Length) })
-    }
-
-    function Get-Instructions([string]$Base) {
-        $text = ''
-        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt')) {
-            $text += [System.IO.File]::ReadAllText($file.FullName)
-        }
-        return $text
-    }
-
-    # The command the instructions give to close run $Id by hand, as written
-    # into RESTORE-INSTRUCTIONS.txt, or '' when there is none.
-    function Get-ManualCloseCommand([string]$Base, [string]$Id) {
-        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt' | Sort-Object LastWriteTime -Descending)) {
-            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
-                if ($line.Contains('WriteAllLines(') -and $line.Contains("'$Id'")) { return $line.Trim() }
-            }
-        }
-        return ''
-    }
-
-    # Runs that command, exactly as a user would paste it.
-    function Invoke-ManualClose([string]$Base, [string]$Id) {
-        $command = Get-ManualCloseCommand $Base $Id
-        Check ($command -ne '') 'the instructions give a command that closes the run by hand'
-        Check ($command -notmatch 'New-Item') 'the command does not create an empty file'
-        if ($command -ne '') { Invoke-Expression $command }
-    }
-
-    function Get-DonePath([string]$Base, [string]$Id) { return (Join-Path (Get-StateDir $Base) "done-$Id.txt") }
-
-    function Get-TempMarkers([string]$Base) {
-        $state = Get-StateDir $Base
-        if (-not (Test-Path -LiteralPath $state)) { return @() }
-        return @(Get-ChildItem -LiteralPath $state -Force | Where-Object { $_.Name.StartsWith('tmp-done-') })
-    }
-
-    function Get-ManifestHashes([string]$Base) {
-        return (@(Get-Manifests $Base | Sort-Object Name | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',')
-    }
-
-    function Test-Done([string]$Base, [string]$Id) {
-        return (Test-Path -LiteralPath (Join-Path (Get-StateDir $Base) "done-$Id.txt"))
-    }
-
-    # What every case of this group must show after a stop.
-    function Check-SentinelStop([string]$Base, [int]$Code, [string]$Id, [string]$ManifestHashes) {
-        $output = Get-LastOutput
-        Check ($Code -eq 3) "exit code 3, got $Code"
-        Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-        Check ($output -match 'original path restored:\s+NO') 'the data path is not reported as restored'
-        Check ($output -notmatch 'Test directory moved|Test directory renamed|Original data directory restored') 'nothing was moved or restored'
-        Check (Test-Path -LiteralPath (Get-Root $Base) -PathType Container) 'the unknown directory is still in the data path'
-        Check ((Get-ManifestHashes $Base) -eq $ManifestHashes) 'the manifest is unchanged'
-        Check (-not (Test-Done $Base $Id)) 'the run is not marked as finished'
-        $instructions = Get-Instructions $Base
-        Check ($instructions.Contains($Id)) 'the instructions name the run id'
-        Check ($instructions.Contains((Get-Root $Base))) 'the instructions name the data path'
-        Check ($instructions -match 'NOT moved, deleted or overwritten') 'the instructions say what is not moved automatically'
-    }
-
-    foreach ($entry in @(
-            @{ Name = 'removed'; Fault = 'drop-sentinel'; Original = $false },
-            @{ Name = 'damaged'; Fault = 'damage-sentinel'; Original = $false },
-            @{ Name = 'removed'; Fault = 'drop-sentinel'; Original = $true },
-            @{ Name = 'damaged'; Fault = 'damage-sentinel'; Original = $true })) {
-        $kind = 'no data directory before the run'
-        if ($entry.Original) { $kind = 'data directory and backup' }
-        Start-Case "A: $kind, test directory installed, sentinel $($entry.Name): stop, nothing moved; resolved by hand, then -RestoreOnly"
-        $base = New-Base ("sentinel-" + [guid]::NewGuid().ToString('N').Substring(0, 8)) $entry.Original
-        $before = '<absent>'
-        if ($entry.Original) { $before = Get-Snapshot (Get-Root $base) }
-        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
-        $id = @(Get-RunIds $base)[0]
-        $hashes = Get-ManifestHashes $base
-        Check-SentinelStop $base $code $id $hashes
-        $unknown = Get-Snapshot (Get-Root $base)
-        $backups = @(Get-Backups $base)
-        if ($entry.Original) {
-            Check ($backups.Count -eq 1) 'exactly one backup directory'
-            if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
-        } else {
-            Check ($backups.Count -eq 0) 'no backup directory (there was no data directory)'
-        }
-        # -RestoreOnly cannot decide either.
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check-SentinelStop $base $code $id $hashes
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly moved nothing'
-        # A new run must not take the unknown directory for the data of the user.
-        $code = Invoke-Check $base @()
-        Check ($code -eq 3) "a new run refuses with 3, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
-        Check ((Get-Snapshot (Get-Root $base)) -eq $unknown) 'the unknown directory was not overwritten'
-        # By hand: the user looks into the directory and moves it away.
-        Move-Item -LiteralPath (Get-Root $base) -Destination (Join-Path $base 'moved-away-by-hand')
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "-RestoreOnly after the directory was moved away by hand: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds exactly what was there before the run'
-        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
-        Check (Test-Done $base $id) 'the run is marked as finished'
-        Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is still unchanged'
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly changed nothing'
-        $code = Invoke-Check $base @()
-        Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'and leaves the data path as it was'
-    }
-
-    Start-Case 'A: interrupted run without a data directory, sentinel removed afterwards: -RestoreOnly does not say "nothing to restore"'
-    $base = New-InterruptedBase 'sentinel-interrupted' $false
-    $id = @(Get-RunIds $base)[0]
-    $hashes = Get-ManifestHashes $base
-    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check-SentinelStop $base $code $id $hashes
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-
-    Start-Case 'A: the manifest says the test directory was installed, but the data path holds an unknown directory: stop; acknowledged by hand'
-    $base = New-InterruptedBase 'unknown-directory' $false
-    $id = @(Get-RunIds $base)[0]
-    $hashes = Get-ManifestHashes $base
-    Move-Item -LiteralPath (Get-Root $base) -Destination (Join-Path $base 'test-dir-taken-out-by-the-test')
-    New-Item -ItemType Directory -Path (Join-Path (Get-Root $base) 'data') -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'), 'data that appeared later')
-    $unknown = Get-Snapshot (Get-Root $base)
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check-SentinelStop $base $code $id $hashes
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 3) "a new run refuses with 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
-    # An empty "done" file, the old way to close a run, is not accepted any more.
-    $empty = Join-Path (Get-StateDir $base) "done-$id.txt"
-    New-Item -ItemType File -Path $empty | Out-Null
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "an empty done file does not close the run: exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved and the empty file was not changed'
-    Remove-Item -LiteralPath $empty -Force
-    # By hand: the user decides that the directory is data and closes the run with the command of the instructions.
-    Invoke-ManualClose $base $id
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly after the run was closed by hand: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $unknown) 'the directory in the data path was not touched'
-
-    Start-Case 'A: a truly clean state still means "nothing to restore"'
-    $base = New-Base 'clean-state'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "exit code 0, got $code"
-    Check ((Get-LastOutput) -match 'Nothing to restore') 'it says "nothing to restore"'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    Start-Case "A: fault 'touched-write': the data path was not touched"
-    $base = New-Base 'fault-touched-write'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'touched-write')
-    Check ($code -eq 1) "exit code 1, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged and in its place'
-    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory'
-
-    # ---------------------------------------------------------------------------
-    # Group B: the check after the rename back does not pass
-    # ---------------------------------------------------------------------------
-
-    # What every case of this group must show after the failed second check.
-    function Check-UnconfirmedRestore([string]$Base, [int]$Code, [string]$Id) {
-        $output = Get-LastOutput
-        Check ($Code -eq 3) "exit code 3, got $Code"
-        Check ($output -match 'original path restored:\s+NO') 'the restore is not reported as confirmed'
-        Check ($output -match 'fingerprint NOT confirmed') 'the outcome says where the data is and that it is not confirmed'
-        Check ($output -notmatch 'Original data directory restored') 'it does not say "restored"'
-        Check (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $Base) 'data') 'atlas.db')) 'the directory really is in the data path'
-        Check (@(Get-Backups $Base).Count -eq 0) 'no backup directory is left (it was renamed back)'
-        Check (-not (Test-Done $Base $Id)) 'the run is not marked as finished'
-        $instructions = Get-Instructions $Base
-        Check ($instructions -match 'ALREADY renamed back') 'the instructions say the directory is already in the data path'
-        Check ($instructions -match 'NOT confirmed') 'the instructions say the restore is not confirmed'
-        Check ($instructions.Contains($Id)) 'the instructions name the run id'
-    }
-
-    Start-Case 'B: the directory differs after the rename back: restore fails with 3; -RestoreOnly overwrites nothing; fixed by hand'
-    $base = New-Base 'postcheck-mismatch'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'tamper-after-restore')
-    $id = @(Get-RunIds $base)[0]
-    $hashes = Get-ManifestHashes $base
-    Check-UnconfirmedRestore $base $code $id
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
-    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly moved and overwrote nothing'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 3) "a new run refuses with 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
-    # By hand: the user removes what does not belong there.
-    Remove-Item -LiteralPath (Join-Path (Get-Root $base) 'added-after-restore.txt') -Force
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly after the fix: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
-    Check (Test-Done $base $id) 'the run is marked as finished'
-    Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is unchanged'
-
-    Start-Case 'B: the check after the rename back cannot be done: restore fails with 3; a later -RestoreOnly confirms it'
-    $base = New-Base 'postcheck-error'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'postcheck-error')
-    $id = @(Get-RunIds $base)[0]
-    Check-UnconfirmedRestore $base $code $id
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the contents in the data path are the original ones'
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'postcheck-error')
-    Check ($code -eq 0 -or $code -eq 3) "a second -RestoreOnly ends with 0 or 3, got $code"
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
-    Check (Test-Done $base $id) 'the run is marked as finished'
-
-    foreach ($entry in @(
-            @{ Name = 'interrupted after the isolation'; Fault = 'crash-after-isolation' },
-            @{ Name = 'interrupted right after the rename'; Fault = 'crash-after-backup' })) {
-        Start-Case "B: -RestoreOnly ($($entry.Name)) meets the failed second check: 3, then no overwrite, then fixed by hand"
-        $base = New-Base ("postcheck-restore-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        $before = Get-Snapshot (Get-Root $base)
-        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
-        Check ($code -eq 99) "setup: the interrupted run ends with 99, got $code"
-        $id = @(Get-RunIds $base)[0]
-        $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'tamper-after-restore')
-        Check-UnconfirmedRestore $base $code $id
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 3) "second -RestoreOnly: exit code 3, got $code"
-        Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved and overwrote nothing'
-        Remove-Item -LiteralPath (Join-Path (Get-Root $base) 'added-after-restore.txt') -Force
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "-RestoreOnly after the fix: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
-    }
-
-    # ---------------------------------------------------------------------------
-    # Group C: the "done" marker
-    # ---------------------------------------------------------------------------
-
-    function Get-ValidDoneLines([string]$Id) {
-        return @('format=atlas-sqlite-check-marker-1', 'kind=done', "run_id=$Id", 'written=20261116-093000', "end=$Id")
-    }
-
-    Start-Case 'C: the marker the script writes is whole, and a finished run stays finished'
-    $base = New-Base 'done-own'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "exit code 0, got $code"
-    $id = @(Get-RunIds $base)[0]
-    $done = Get-DonePath $base $id
-    Check (Test-Path -LiteralPath $done -PathType Leaf) 'the done marker exists'
-    $lines = @([System.IO.File]::ReadAllLines($done))
-    Check ($lines.Count -eq 5 -and $lines[0] -ceq 'format=atlas-sqlite-check-marker-1' -and $lines[1] -ceq 'kind=done' -and $lines[2] -ceq "run_id=$id" -and $lines[3] -cmatch '^written=\d{8}-\d{6}$' -and $lines[4] -ceq "end=$id") 'it has exactly the five documented lines'
-    Check (@(Get-TempMarkers $base).Count -eq 0) 'no temporary file is left'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the valid marker was not rewritten and nothing was moved'
-
-    $foreign = [guid]::NewGuid().ToString('N')
-    foreach ($entry in @(
-            @{ Name = 'empty'; Kind = 'lines'; Lines = @() },
-            @{ Name = 'cut short (three of five lines)'; Kind = 'cut' },
-            @{ Name = 'cut short (the last line is missing)'; Kind = 'cut4' },
-            @{ Name = 'with the run id of another run'; Kind = 'foreign' },
-            @{ Name = 'in the old two-line format'; Kind = 'old' },
-            @{ Name = 'with an extra line'; Kind = 'extra' },
-            @{ Name = 'that only contains the run id somewhere'; Kind = 'substring' },
-            @{ Name = 'that cannot be read (a directory of that name)'; Kind = 'directory' })) {
-        Start-Case "C: a done marker $($entry.Name) does not close the run: exit 3, nothing changed; replaced by hand, then fine"
-        $base = New-Base ("done-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        $before = Get-Snapshot (Get-Root $base)
-        $code = Invoke-Check $base @()
-        Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
-        $id = @(Get-RunIds $base)[0]
-        $done = Get-DonePath $base $id
-        $hashes = Get-ManifestHashes $base
-        $valid = Get-ValidDoneLines $id
-        Remove-Item -LiteralPath $done -Force
-        switch ($entry.Kind) {
-            'lines' { [System.IO.File]::WriteAllLines($done, [string[]]@()) }
-            'cut' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..2])) }
-            'cut4' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..3])) }
-            'foreign' { [System.IO.File]::WriteAllLines($done, [string[]]@(Get-ValidDoneLines $foreign)) }
-            'old' { [System.IO.File]::WriteAllLines($done, [string[]]@("run_id=$id", 'written=20261116-093000')) }
-            'extra' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid + @('more=1'))) }
-            'substring' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0], $valid[1], "x run_id=$id y", $valid[3], $valid[4])) }
-            'directory' { New-Item -ItemType Directory -Path $done | Out-Null }
-        }
-        $state = Get-Snapshot (Get-Local $base)
-        $code = Invoke-Check $base @('-RestoreOnly')
-        $output = Get-LastOutput
-        Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
-        Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-        Check ($output -match 'not a valid "done" marker') 'the invalid marker is reported'
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the marker was not changed and nothing was moved'
-        $instructions = Get-Instructions $base
-        Check ($instructions.Contains($done)) 'the instructions name the exact path of the marker'
-        Check ($instructions.Contains($id)) 'the instructions name the run id'
-        Check ($instructions -match 'repairs nothing and restores nothing') 'the instructions say what the marker does not do'
-        Check ($instructions -match 'do NOT create the marker') 'the instructions say when not to create it'
-        Check ($instructions -notmatch 'New-Item -ItemType File') 'the instructions do not offer an empty file'
-        # A new run and a second -RestoreOnly: the same, still nothing changed.
-        $code = Invoke-Check $base @()
-        Check ($code -eq 3) "a new run refuses with 3, got $code"
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 3) "second -RestoreOnly: exit code 3, got $code"
-        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'still nothing was changed'
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-        Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is unchanged'
-        # By hand, as the instructions say: the invalid file aside, the whole marker in its place.
-        Rename-Item -LiteralPath $done -NewName ("invalid-" + (Split-Path -Leaf $done))
-        Invoke-ManualClose $base $id
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "-RestoreOnly after the marker was replaced by hand: exit code 0, got $code"
-        $code = Invoke-Check $base @()
-        Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-    }
-
-    Start-Case 'C: an invalid done marker while a backup and a test directory wait: nothing is moved; without it the restore goes on'
-    $base = New-InterruptedBase 'done-pending'
-    $id = @(Get-RunIds $base)[0]
-    $done = Get-DonePath $base $id
-    [System.IO.File]::WriteAllText($done, '')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-LastOutput) -notmatch 'Test directory moved|Original data directory restored') 'neither the test directory nor the backup was moved'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-    Check (@(Get-Backups $base).Count -eq 1 -and (Test-IsTestDir (Get-Root $base))) 'the backup and the test directory are where they were'
-    Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
-    Check (@(Get-Backups $base).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'))) 'the original is back'
-    Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the script wrote the whole marker itself'
-
-    Start-Case 'C: the markers cannot be read at all: a refusal'
-    $base = New-Base 'done-read-error'
-    $code = Invoke-Check $base @()
-    Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'done-read-error')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    Start-Case 'C: a file named like a done marker without a run id is reported, not ignored'
-    $base = New-Base 'done-no-id'
-    $code = Invoke-Check $base @()
-    $stray = Join-Path (Get-StateDir $base) 'done-run id.txt'
-    [System.IO.File]::WriteAllText($stray, 'x')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-
-    Start-Case 'C: a temporary marker file that was left behind does not close the run'
-    $base = New-InterruptedBase 'done-temp-left' $false
-    $id = @(Get-RunIds $base)[0]
-    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
-    $temp = Join-Path (Get-StateDir $base) "tmp-done-$id-$([guid]::NewGuid().ToString('N')).tmp"
-    [System.IO.File]::WriteAllLines($temp, [string[]]@(Get-ValidDoneLines $id))
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check (-not (Test-Path -LiteralPath (Get-DonePath $base $id))) 'no done marker appeared'
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the temporary file was neither used nor deleted, nothing was moved'
-
-    foreach ($entry in @(
-            @{ Name = 'the temporary file cannot be written'; Fault = 'done-temp-write'; Temp = 0 },
-            @{ Name = 'the temporary file is written only in part'; Fault = 'done-temp-partial'; Temp = 1 },
-            @{ Name = 'the rename into place fails'; Fault = 'done-rename'; Temp = 1 })) {
-        Start-Case "C: $($entry.Name): no done marker, exit 3; a later -RestoreOnly closes the run"
-        $base = New-Base ("done-w-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        $before = Get-Snapshot (Get-Root $base)
-        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
-        $id = @(Get-RunIds $base)[0]
-        $done = Get-DonePath $base $id
-        Check ($code -eq 3) "exit code 3 (the run is not confirmed as finished), got $code"
-        Check (-not (Test-Path -LiteralPath $done)) 'no done marker exists'
-        Check (@(Get-TempMarkers $base).Count -eq $entry.Temp) "temporary files left: $($entry.Temp) (they are not deleted)"
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is in its place and unchanged'
-        Check ((Get-LastOutput) -match 'could not be marked as finished') 'the reason is named'
-        $temps = @(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ','
-        $code = Invoke-Check $base @('-RestoreOnly')
-        Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
-        Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the whole done marker is written now'
-        Check ((@(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',') -eq $temps) 'the old temporary files are still there, unchanged, and no new one is left'
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-    }
-
-    Start-Case 'C: a file that takes the final name at the last moment is never overwritten'
-    $base = New-Base 'done-final-appears'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-TestFault', 'done-final-appears')
-    $id = @(Get-RunIds $base)[0]
-    $done = Get-DonePath $base $id
-    Check ($code -eq 3) "exit code 3, got $code"
-    Check (([System.IO.File]::ReadAllText($done)) -eq 'not written by this run') 'the file that was there first is unchanged'
-    Check (@(Get-TempMarkers $base).Count -eq 1) 'the temporary file stays'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 3) "-RestoreOnly: exit code 3 (the file is not a valid marker), got $code"
-    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-    Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
-    $code = Invoke-Check $base @('-RestoreOnly')
-    Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
-
-    # ---------------------------------------------------------------------------
-    # Group D: finding the application, without paths of the repository
-    # ---------------------------------------------------------------------------
-
-    # A stand-in for the application, at a path below the test profile.
-    function New-FakeExe([string]$Base, [string]$Relative) {
-        $path = Join-Path $Base $Relative
-        if (-not $OnWindows) { $path = $path -replace '\\', '/' -replace '\.exe$', '' }
-        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
-        [System.IO.File]::WriteAllText($path, 'not really ATLAS')
-        return $path
-    }
-
-    # What a refusal before any change must show.
-    function Check-EarlyStop([string]$Base, [int]$Code, [string]$State, [string]$Pattern) {
-        Check ($Code -eq 2) "exit code 2, got $Code"
-        Check ((Get-Snapshot (Get-Local $Base)) -eq $State) 'nothing was changed'
-        Check (@(Get-Manifests $Base).Count -eq 0) 'no manifest was written'
-        $runs = @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'run.txt')
-        $text = ''
-        foreach ($file in $runs) { $text += [System.IO.File]::ReadAllText($file.FullName) }
-        Check ($text -match 'STOPPED before any change') 'the stop is written to run.txt'
-        Check ($text -match $Pattern) 'the reason is written to run.txt'
-        Check ((Get-LastOutput) -match 'original path restored:\s+yes') 'the outcome says the data is in its place'
-    }
-
-    Start-Case 'D: -Exe that does not exist: refuse before any change, the reason is in the report'
-    $base = New-Base 'exe-missing'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-Exe', (Join-Path $base 'nowhere\atlas.exe'))
-    Check-EarlyStop $base $code $state 'does not exist'
-
-    Start-Case 'D: no -Exe and nothing found: refuse before any change, the places searched are listed'
-    $base = New-Base 'exe-none'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
-    Check-EarlyStop $base $code $state 'was not found'
-    Check ((Get-LastOutput) -match 'ATLAS') 'the places searched are named'
-
-    Start-Case 'D: no -Exe and two copies found: no guess, refuse before any change'
-    $base = New-Base 'exe-two'
-    $null = New-FakeExe $base 'cwd\atlas.exe'
-    $null = New-FakeExe $base 'local\ATLAS\ATLAS.exe'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
-    Check-EarlyStop $base $code $state 'Several copies'
-
-    foreach ($entry in @(
-            @{ Name = 'a build in the current directory'; Path = 'cwd\src-tauri\target\release\atlas.exe' },
-            @{ Name = 'a copy next to the script'; Path = 'scriptdir\atlas.exe' },
-            @{ Name = 'an installed copy below %LOCALAPPDATA%'; Path = 'local\ATLAS\ATLAS.exe' },
-            @{ Name = 'an installed copy below Program Files'; Path = 'programfiles\ATLAS\ATLAS.exe' })) {
-        Start-Case "D: no -Exe, only $($entry.Name): it is used, the data comes back"
-        $base = New-Base ("exe-one-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        $fake = New-FakeExe $base $entry.Path
-        $before = Get-Snapshot (Get-Root $base)
-        $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
-        Check ($code -eq 0) "exit code 0, got $code"
-        Check ((Get-LastOutput).Contains("Application: $fake")) 'the copy found is named'
-        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-    }
-
-    Start-Case 'D: environment.txt records the SHA-256 of the script itself'
-    $base = New-Base 'script-hash'
-    $code = Invoke-Check $base @()
-    $environment = ''
-    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'environment.txt')) { $environment += [System.IO.File]::ReadAllText($file.FullName) }
-    Check ($environment.Contains("script sha256: $((Get-FileHash -LiteralPath $Script -Algorithm SHA256).Hash)")) 'the hash is the hash of this file'
-
-    Start-Case 'D: -Exe of a file that exists: it is used and recorded with its hash'
-    $base = New-Base 'exe-given'
-    $fake = New-FakeExe $base 'elsewhere\with space\atlas.exe'
-    $before = Get-Snapshot (Get-Root $base)
-    $code = Invoke-Check $base @('-Exe', $fake)
-    Check ($code -eq 0) "exit code 0, got $code"
-    $environment = ''
-    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'environment.txt')) { $environment += [System.IO.File]::ReadAllText($file.FullName) }
-    Check ($environment.Contains("exe: $fake")) 'environment.txt names the application'
-    Check ($environment -match 'exe sha256: [0-9A-F]{64}') 'environment.txt has its hash'
-    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
-
-    Start-Case 'D: -Build without -Source and outside a repository: refuse before any change'
-    $base = New-Base 'build-no-source'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-Build')
-    Check-EarlyStop $base $code $state 'needs a copy of the ATLAS repository'
-
-    Start-Case 'D: -Build with a -Source that does not exist: refuse before any build and any change'
-    $base = New-Base 'build-source-missing'
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-Build', '-Source', (Join-Path $base 'no such folder'))
-    Check-EarlyStop $base $code $state 'not an existing directory'
-
-    Start-Case 'D: -Build with a -Source that is not the repository: refuse before any build and any change'
-    $base = New-Base 'build-source-wrong'
-    $wrong = Join-Path $base 'some folder'
-    New-Item -ItemType Directory -Path (Join-Path $wrong 'src-tauri') -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $wrong 'package.json'), '{}')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-Build', '-Source', $wrong)
-    Check-EarlyStop $base $code $state 'not a copy of the ATLAS repository'
-    Check ((Get-LastOutput) -notmatch 'Building the application') 'no build was started'
-
-    Start-Case 'D: -Build with a -Source that looks right is accepted, and the tests still build nothing'
-    $base = New-Base 'build-source-right'
-    $right = Join-Path $base 'repo copy'
-    New-Item -ItemType Directory -Path (Join-Path $right 'src-tauri') -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $right 'package.json'), '{}')
-    [System.IO.File]::WriteAllText((Join-Path (Join-Path $right 'src-tauri') 'Cargo.toml'), '[package]')
-    $state = Get-Snapshot (Get-Local $base)
-    $code = Invoke-Check $base @('-Build', '-Source', $right)
-    Check-EarlyStop $base $code $state 'was accepted'
-    Check ((Get-LastOutput) -notmatch 'Building the application') 'no build was started'
-    Check (-not (Test-Path -LiteralPath (Join-Path $right 'node_modules'))) 'nothing was installed into the source'
-
-    Start-Case 'D: -Keep without -SelfTest is refused'
-    $log = Join-Path $Work 'keep.txt'
-    $all = @('-NoLogo', '-NoProfile')
-    if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
-    $all += @('-File', $Script, '-Keep')
-    $code = Invoke-Shell $all $log
-    Check ($code -ne 0) 'the script does not run'
-    Check ((([System.IO.File]::ReadAllText($log)) -replace '\s', '') -match 'only-SelfTest|onlyfor-SelfTest') 'the reason is named'
-
-
-    # ---------------------------------------------------------------------------
-    # Guard rails of the test switches
-    # ---------------------------------------------------------------------------
-
-    Start-Case '-TestFault without -TestBase is refused'
-    $log = Join-Path $Work 'guard.txt'
-    $all = @('-NoLogo', '-NoProfile')
-    if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
-    $all += @('-File', $Script, '-TestFault', 'backup-restore')
-    $code = Invoke-Shell $all $log
-    Check ($code -ne 0) 'the script does not run'
-    # The message of an uncaught error is wrapped by the shell: compare without white space.
-    Check ((([System.IO.File]::ReadAllText($log)) -replace '\s', '') -match 'needs-TestBase') 'the reason is named'
-
-    Start-Case 'the real profile was not touched and ATLAS was not started by the tests'
-    Check ((Get-RealProfileState) -eq $realProfileBefore) 'nothing named com.inlerno.atlas* in the real local application data changed'
-    $started = @(Get-AtlasProcessIds | Where-Object { $atlasBefore -notcontains $_ })
-    Check ($started.Count -eq 0) "no new ATLAS process appeared (new: $($started -join ', '))"
-    Check (-not (Test-SamePathForTest $Work ([Environment]::GetFolderPath('LocalApplicationData')))) 'the tests worked in a temporary directory'
-
-    Stop-Case
-
-    Write-Host ''
-    Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)); cases: $($script:Cases.Count); checks: $($script:Checks); failed checks: $($script:Failures.Count)"
-    if ($Keep) { Write-Host "Kept: $Work" }
-    else { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
-    if ($script:Failures.Count -gt 0) {
-        $script:Failures | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-        exit 1
-    }
-    exit 0
-}
 
 # ---------------------------------------------------------------------------
 # Constants and paths
@@ -1432,8 +213,31 @@ $RunId = [guid]::NewGuid().ToString('N')
 # Windows PowerShell 5.1 has no $IsWindows; it only runs on Windows.
 $OnWindows = ($PSVersionTable.PSEdition -ne 'Core') -or $IsWindows
 
-if ($TestFault -and -not $TestBase) {
-    throw '-TestFault is only for the tests of this script and needs -TestBase. Nothing was changed.'
+# The test switches. Nothing but -SelfTest opens them:
+#   -SelfTest                         the whole test suite; the real profile is
+#                                     only watched, never changed;
+#   -SelfTest -TestBase X             the guard of the suite checks itself, with
+#                                     X\local in the place of the real profile;
+#   -SelfTest -TestBase X -TestRun    one run of the script itself against the
+#                                     test profile X (what the cases start).
+# -TestFault needs -SelfTest -TestBase. Every other combination is refused
+# here, before anything is read or changed.
+if ($TestBase -and -not $SelfTest) {
+    throw '-TestBase is only for the tests of this script and needs -SelfTest. Nothing was changed.'
+}
+if ($TestFault -and -not ($SelfTest -and $TestBase)) {
+    throw '-TestFault is only for the tests of this script and needs -SelfTest -TestBase. Nothing was changed.'
+}
+if ($TestRun -and -not ($SelfTest -and $TestBase)) {
+    throw '-TestRun is only for the tests of this script and needs -SelfTest -TestBase. Nothing was changed.'
+}
+if ($Keep -and (-not $SelfTest -or $TestBase)) {
+    throw '-Keep is only for -SelfTest without -TestBase. Nothing was changed.'
+}
+$SuiteMode = [bool]$SelfTest -and -not $TestBase
+$GuardMode = [bool]$SelfTest -and [bool]$TestBase -and -not $TestRun
+if (($SuiteMode -or $GuardMode) -and ($Exe -or $Build -or $RestoreOnly -or $Source)) {
+    throw '-SelfTest does not take -Exe, -Build, -RestoreOnly or -Source. Nothing was changed.'
 }
 if ($TestBase) {
     if (-not (Test-Path -LiteralPath $TestBase -PathType Container)) {
@@ -2623,6 +1427,74 @@ function Test-Interactive {
     try { return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) } catch { return $false }
 }
 
+# A JSON file as an object. Throws, with the reason, when it is missing,
+# unreadable, not JSON or not a JSON object.
+function Read-JsonObject([string]$Path, [string]$What) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$What is missing" }
+    $text = $null
+    try { $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) }
+    catch { throw "$What cannot be read" }
+    $value = $null
+    try { $value = $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "$What is not valid JSON" }
+    if ($null -eq $value -or $value -isnot [System.Management.Automation.PSCustomObject]) { throw "$What is not a JSON object" }
+    return $value
+}
+
+# A string property of a JSON object, or $null when it is absent or not a string.
+function Get-JsonString($Object, [string]$Name) {
+    if ($null -eq $Object -or $Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property -or $property.Value -isnot [string]) { return $null }
+    return $property.Value
+}
+
+# The `name = "..."` of every table of a Cargo.toml, by table. A name counts
+# only for the table it stands in. Throws when the file is missing or cannot
+# be read, or when a table has two names.
+function Get-CargoTableNames([string]$Path, [string]$What) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$What is missing" }
+    $lines = $null
+    try { $lines = [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8) }
+    catch { throw "$What cannot be read" }
+    $names = @{}
+    $table = ''
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[\[') { $table = '[[array]]'; continue }
+        if ($line -match '^\s*\[\s*([^\]]+?)\s*\]\s*(#.*)?$') { $table = $Matches[1]; continue }
+        if ($line -match '^\s*name\s*=\s*"([^"]*)"\s*(#.*)?$') {
+            if ($names.ContainsKey($table)) { throw "$What has two names in [$table]" }
+            $names[$table] = $Matches[1]
+        }
+    }
+    return $names
+}
+
+# Why a directory is not a copy of the ATLAS repository, or '' when it is
+# one. Several independent signs must agree; the identifier is the one this
+# script isolates the data of. Nothing is run and nothing is written.
+function Get-SourceDefect([string]$Directory) {
+    try {
+        $package = Read-JsonObject (Join-Path $Directory 'package.json') 'package.json'
+        $name = Get-JsonString $package 'name'
+        if ($name -cne 'atlas') { return "package.json: `"name`" is not `"atlas`"" }
+        $scripts = $null
+        if ($null -ne $package.PSObject.Properties['scripts']) { $scripts = $package.PSObject.Properties['scripts'].Value }
+        if (-not (Get-JsonString $scripts 'build')) { return 'package.json: there is no "build" script' }
+
+        $cargo = Get-CargoTableNames (ConvertTo-PlatformPath (Join-Path $Directory 'src-tauri\Cargo.toml')) 'src-tauri/Cargo.toml'
+        if (-not $cargo.ContainsKey('package') -or $cargo['package'] -cne 'atlas') { return 'src-tauri/Cargo.toml: name in [package] is not "atlas"' }
+        if (-not $cargo.ContainsKey('lib') -or $cargo['lib'] -cne 'atlas_lib') { return 'src-tauri/Cargo.toml: name in [lib] is not "atlas_lib"' }
+
+        $tauri = Read-JsonObject (ConvertTo-PlatformPath (Join-Path $Directory 'src-tauri\tauri.conf.json')) 'src-tauri/tauri.conf.json'
+        if ((Get-JsonString $tauri 'identifier') -cne $AppId) { return "src-tauri/tauri.conf.json: `"identifier`" is not `"$AppId`", the application whose data this script isolates" }
+        if ((Get-JsonString $tauri 'productName') -cne 'ATLAS') { return 'src-tauri/tauri.conf.json: "productName" is not "ATLAS"' }
+    } catch {
+        return "$($_.Exception.Message)"
+    }
+    return ''
+}
+
 # The repository to build from: -Source, or the current directory if it is one.
 function Get-SourceDirectory {
     $candidate = $Source
@@ -2633,11 +1505,10 @@ function Get-SourceDirectory {
         if ($Source) { throw "-Source is not an existing directory: $Source. Nothing was changed." }
         throw '-Build needs a copy of the ATLAS repository: pass -Source <folder> or start the script in that folder. Nothing was changed.'
     }
-    $cargo = ConvertTo-PlatformPath (Join-Path $candidate 'src-tauri\Cargo.toml')
-    $package = Join-Path $candidate 'package.json'
-    if (-not (Test-Path -LiteralPath $cargo -PathType Leaf) -or -not (Test-Path -LiteralPath $package -PathType Leaf)) {
-        if ($Source) { throw "-Source is not a copy of the ATLAS repository (no src-tauri\Cargo.toml or package.json): $Source. Nothing was changed." }
-        throw '-Build needs a copy of the ATLAS repository: pass -Source <folder> or start the script in that folder. Nothing was changed.'
+    $defect = Get-SourceDefect $candidate
+    if ($defect) {
+        if ($Source) { throw "-Source is not a copy of the ATLAS repository: $defect. Nothing was changed." }
+        throw "-Build needs a copy of the ATLAS repository: pass -Source <folder> or start the script in that folder (the current directory is not one: $defect). Nothing was changed."
     }
     return (Resolve-Path -LiteralPath $candidate).Path
 }
@@ -2863,6 +1734,1702 @@ function Find-Python {
         } catch { continue }
     }
     return $null
+}
+
+# ---------------------------------------------------------------------------
+# -SelfTest: the tests of this script
+# ---------------------------------------------------------------------------
+# Every case builds a profile of its own in a temporary directory and runs
+# this file against it with -SelfTest -TestBase -TestRun. In that mode the
+# script never starts ATLAS and never looks at %LOCALAPPDATA%, so the tests
+# do not touch any real data. Faults are injected with -TestFault.
+#
+# The suite does not take that on trust: everything named com.inlerno.atlas*
+# in the profile is recorded before and after, and the suite fails when the
+# two records differ or when one of them cannot be taken completely.
+# -SelfTest -TestBase makes this guard check itself against a test profile.
+
+if ($SuiteMode -or $GuardMode) {
+    # The folder that is watched: the real %LOCALAPPDATA%, or <TestBase>\local
+    # when the guard checks itself (the real one is not read then).
+    $ProfileParent = $LocalAppData
+
+    # Only for the tests of the record itself, set by the cases below: the
+    # relative path at which listing or hashing must fail.
+    $script:SnapshotFailList = ''
+    $script:SnapshotFailHash = ''
+
+    # The record of everything in $Parent whose name starts with the
+    # identifier of ATLAS, one line per object, sorted, so that the order in
+    # which the file system lists things does not matter:
+    #   d|<relative path>                      a directory
+    #   f|<relative path>|<size>|<SHA-256>     a file
+    #   l|<relative path>                      a junction or symbolic link,
+    #                                          recorded and never followed,
+    #                                          so that a loop cannot trap it
+    # The walk is its own, one directory at a time, and every error stops it:
+    # a record that leaves something out would prove nothing.
+    function Get-ProfileSnapshot([string]$Parent) {
+        if (-not (Test-Path -LiteralPath $Parent -PathType Container)) { throw "the folder $Parent does not exist" }
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        $queue = New-Object System.Collections.Queue
+        $top = $null
+        try { $top = @(Get-ChildItem -LiteralPath $Parent -Force -ErrorAction Stop) }
+        catch { throw "the folder $Parent cannot be listed: $($_.Exception.Message)" }
+        foreach ($entry in $top) {
+            if ($entry.Name.StartsWith($AppId, [System.StringComparison]::OrdinalIgnoreCase)) { $queue.Enqueue(@($entry, $entry.Name)) }
+        }
+        while ($queue.Count -gt 0) {
+            $pair = $queue.Dequeue()
+            $item = $pair[0]
+            $relative = $pair[1]
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $lines.Add("l|$relative")
+                continue
+            }
+            if ($item.PSIsContainer) {
+                $lines.Add("d|$relative")
+                $children = $null
+                try {
+                    if ($script:SnapshotFailList -and $script:SnapshotFailList -eq $relative) { throw 'injected test fault: the directory cannot be listed' }
+                    $children = @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)
+                } catch { throw "the directory $relative cannot be listed: $($_.Exception.Message)" }
+                foreach ($child in $children) { $queue.Enqueue(@($child, "$relative/$($child.Name)")) }
+                continue
+            }
+            $hash = $null
+            try {
+                if ($script:SnapshotFailHash -and $script:SnapshotFailHash -eq $relative) { throw 'injected test fault: the file cannot be read' }
+                $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+            } catch { throw "the file $relative cannot be read: $($_.Exception.Message)" }
+            if (-not $hash) { throw "the file $relative gave no hash" }
+            $lines.Add("f|$relative|$($item.Length)|$hash")
+        }
+        $lines.Sort([System.StringComparer]::Ordinal)
+        return ($lines.ToArray() -join "`n")
+    }
+
+    function Get-SnapshotCount([string]$Snapshot) {
+        if (-not $Snapshot) { return 0 }
+        return @($Snapshot -split "`n").Count
+    }
+
+    $guardFaults = @('profile-initial-error', 'profile-final-error', 'profile-change')
+    if ($GuardMode) {
+        foreach ($fault in $Faults) {
+            if ($guardFaults -notcontains $fault) { throw "-SelfTest -TestBase without -TestRun knows only these faults: $($guardFaults -join ', '). Nothing was changed." }
+        }
+    }
+
+    # ATLAS must not be running: its files are held and change, and a failed
+    # record must not be the way this is found out.
+    $alive = $null
+    try {
+        $blocking = Get-Blocking
+        $alive = @($blocking.App) + @($blocking.WebView)
+    } catch {
+        Write-Host "It cannot be checked whether ATLAS is running: $($_.Exception.Message)"
+        Write-Host 'The self-test was not started.'
+        exit 2
+    }
+    if ($alive.Count -gt 0) {
+        Write-Host "ATLAS is running: $(Format-Processes $alive)."
+        Write-Host 'Close ATLAS and try again.'
+        Write-Host 'The self-test was not started.'
+        exit 2
+    }
+
+    # The record before the first test case. Without it nothing is run.
+    $profileBefore = $null
+    try {
+        if ($Faults -contains 'profile-initial-error') { throw 'injected test fault: the profile cannot be read' }
+        $profileBefore = Get-ProfileSnapshot $ProfileParent
+    } catch {
+        Write-Host "The profile cannot be recorded completely: $($_.Exception.Message)"
+        Write-Host "Watched: everything named $AppId* in $ProfileParent"
+        Write-Host 'The self-test was not started: it could not prove afterwards that the profile is unchanged.'
+        exit 2
+    }
+    Write-Host "Profile watched: $ProfileParent ($AppId*): $(Get-SnapshotCount $profileBefore) objects recorded"
+
+    if ($GuardMode) {
+        # The guard checks itself: no test case is run. A fault may change
+        # the TEST profile between the two records.
+        if ($Faults -contains 'profile-change') {
+            if (-not (Test-Path -LiteralPath $Root)) { New-Item -ItemType Directory -Path $Root | Out-Null }
+            [System.IO.File]::WriteAllText((Join-Path $Root 'changed-by-the-fault.txt'), 'x')
+        }
+        $problem = ''
+        try {
+            if ($Faults -contains 'profile-final-error') { throw 'injected test fault: the profile cannot be read' }
+            $profileAfter = Get-ProfileSnapshot $ProfileParent
+            if ($profileAfter -cne $profileBefore) { $problem = 'the profile changed between the two records' }
+        } catch { $problem = "the profile cannot be recorded completely afterwards: $($_.Exception.Message)" }
+        if ($problem) {
+            Write-Host "FAILED  profile guard: $problem"
+            exit 1
+        }
+        Write-Host 'ok      profile guard: the profile is unchanged (guard self-check; the test cases are not run in this mode)'
+        exit 0
+    }
+
+    # The tests run this very file as a child process.
+    $Script = $PSCommandPath
+    $Shell = (Get-Process -Id $PID).Path
+    $OnWindows = ($PSVersionTable.PSEdition -ne 'Core') -or $IsWindows
+    $AppId = 'com.inlerno.atlas'
+    $SentinelName = '.atlas-sqlite-check-test-root'
+    # Kept short: Windows PowerShell 5.1 cannot go beyond 260 characters, and the
+    # backup directories of the script carry a time and a 32 digit run id.
+    $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("asct-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $Work | Out-Null
+
+    # What the tests must leave alone, besides the profile: the real ATLAS.
+    function Test-SamePathForTest([string]$Left, [string]$Right) { return ("$Left".TrimEnd('\', '/') -ieq "$Right".TrimEnd('\', '/')) }
+    # The whole list, so that an error is an error and not "no such process".
+    function Get-AtlasProcessIds { return @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -eq 'atlas' } | ForEach-Object { $_.Id }) }
+    $atlasBefore = @(Get-AtlasProcessIds)
+
+    $script:Failures = New-Object System.Collections.ArrayList
+    $script:Checks = 0
+    $script:Case = ''
+    $script:CaseFailed = $false
+    $script:CaseSkipped = ''
+    $script:Cases = New-Object System.Collections.ArrayList
+
+    function Check([bool]$Condition, [string]$What) {
+        $script:Checks++
+        if (-not $Condition) {
+            $script:CaseFailed = $true
+            [void]$script:Failures.Add("$($script:Case): $What")
+            Write-Host "    FAILED: $What" -ForegroundColor Red
+        }
+    }
+
+    function Start-Case([string]$Name) {
+        Stop-Case
+        $script:Case = $Name
+        $script:CaseFailed = $false
+        $script:CaseSkipped = ''
+    }
+
+    # Marks the current case as not run here, with the reason. A skipped case
+    # is counted and shown; it is never shown as passed.
+    function Skip-Case([string]$Why) { $script:CaseSkipped = $Why }
+
+    function Stop-Case {
+        if ($script:Case) {
+            $status = 'ok'
+            if ($script:CaseSkipped) { $status = 'SKIPPED' }
+            if ($script:CaseFailed) { $status = 'FAILED' }
+            [void]$script:Cases.Add("$status  $($script:Case)")
+            Write-Host ("{0,-7} {1}" -f $status, $script:Case)
+            if ($status -eq 'SKIPPED') { Write-Host "        reason: $($script:CaseSkipped)" }
+            $script:Case = ''
+        }
+    }
+
+    # Names and CONTENTS of everything below a directory.
+    function Get-Snapshot([string]$Directory) {
+        if (-not (Test-Path -LiteralPath $Directory)) { return '<absent>' }
+        $base = (Get-Item -LiteralPath $Directory -Force).FullName.TrimEnd('\', '/')
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($item in @(Get-ChildItem -LiteralPath $base -Recurse -Force)) {
+            $relative = $item.FullName.Substring($base.Length + 1).Replace('\', '/')
+            if ($item.PSIsContainer) { $lines.Add("d|$relative") }
+            else { $lines.Add("f|$relative|$((Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash)") }
+        }
+        $lines.Sort([System.StringComparer]::Ordinal)
+        return ($lines.ToArray() -join "`n")
+    }
+
+    # A profile with (or without) a data directory that stands for the user's.
+    function New-Base([string]$Name, [bool]$WithOriginal = $true) {
+        $base = Join-Path $Work $Name
+        New-Item -ItemType Directory -Path (Join-Path $base 'local') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $base 'home') -Force | Out-Null
+        if ($WithOriginal) {
+            $root = Join-Path (Join-Path $base 'local') $AppId
+            New-Item -ItemType Directory -Path (Join-Path $root 'data') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $root 'logs') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path (Join-Path $root 'EBWebView') 'Default') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path (Join-Path $root 'data') 'atlas.db'), 'USER DATABASE - must never change')
+            [System.IO.File]::WriteAllText((Join-Path $root 'storage.initialized'), 'marker')
+            [System.IO.File]::WriteAllText((Join-Path (Join-Path $root 'logs') 'atlas.2026-11-01.log'), 'old log')
+            [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $root 'EBWebView') 'Default') 'Cookies'), 'cookies')
+            # A name that is not ASCII (U+0416 U+0443 U+0440).
+            $cyrillic = ([string][char]0x0416) + ([string][char]0x0443) + ([string][char]0x0440) + '.txt'
+            [System.IO.File]::WriteAllText((Join-Path $root $cyrillic), 'note')
+        }
+        return $base
+    }
+
+    function Get-Root([string]$Base) { return (Join-Path (Join-Path $Base 'local') $AppId) }
+    function Get-Local([string]$Base) { return (Join-Path $Base 'local') }
+    function Get-StateDir([string]$Base) { return (Join-Path (Join-Path $Base 'local') "$AppId.sqlite-check") }
+
+    function Get-Backups([string]$Base) {
+        return @(Get-ChildItem -LiteralPath (Get-Local $Base) -Directory -Force |
+            Where-Object { $_.Name.StartsWith("$AppId.sqlite-check-backup-") })
+    }
+
+    function Get-Manifests([string]$Base) {
+        $state = Get-StateDir $Base
+        if (-not (Test-Path -LiteralPath $state)) { return @() }
+        return @(Get-ChildItem -LiteralPath $state -File -Filter 'manifest-*.txt')
+    }
+
+    function Test-IsTestDir([string]$Directory) {
+        return (Test-Path -LiteralPath (Join-Path $Directory $SentinelName) -PathType Leaf)
+    }
+
+    # Runs the script; returns its exit code. The output goes to a file.
+    function Invoke-Check([string]$Base, [string[]]$Arguments) {
+        $script:RunNumber++
+        $log = Join-Path $Base ("run-{0:d2}.txt" -f $script:RunNumber)
+        $all = @('-NoLogo', '-NoProfile')
+        if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
+        $all += @('-File', $Script, '-SelfTest', '-TestBase', $Base, '-TestRun') + $Arguments
+        $code = Invoke-Shell $all $log
+        $script:LastLog = $log
+        return $code
+    }
+
+    # Runs the shell and writes everything it prints to a file, one line of the
+    # child per line of the file. Not `*> file`: Windows PowerShell 5.1 would
+    # wrap long lines at the width of the console and turn what the child writes
+    # to its error stream into terminating errors.
+    function Invoke-Shell([string[]]$All, [string]$Log) {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $lines = @(& $Shell @All 2>&1 | ForEach-Object { "$_" })
+            $code = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $previous }
+        [System.IO.File]::WriteAllLines($Log, [string[]]$lines)
+        return $code
+    }
+    $script:RunNumber = 0
+    $script:LastLog = ''
+
+    function Get-LastOutput { return ([System.IO.File]::ReadAllText($script:LastLog)) }
+
+    # An interrupted run: the process ends right after the isolation, no `finally`.
+    function New-InterruptedBase([string]$Name, [bool]$WithOriginal = $true) {
+        $base = New-Base $Name $WithOriginal
+        $code = Invoke-Check $base @('-TestFault', 'crash-after-isolation')
+        Check ($code -eq 99) "setup: the interrupted run must end with 99, got $code"
+        return $base
+    }
+
+    # ---------------------------------------------------------------------------
+    # Normal runs
+    # ---------------------------------------------------------------------------
+
+    Start-Case 'normal run: the original comes back unchanged'
+    $base = New-Base 'normal'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
+    Check (-not (Test-IsTestDir (Get-Root $base))) 'the data path does not hold a test directory'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+    Check (@(Get-Manifests $base).Count -eq 1) 'the manifest is kept'
+    Check ((Get-LastOutput) -match 'original path restored:\s+yes') 'the outcome says the path is restored'
+    Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Force -Filter $SentinelName).Count -eq 1) 'the test directory is in the report'
+
+    Start-Case 'normal run twice: the manifest of the first run is not overwritten'
+    $first = (Get-Manifests $base)[0]
+    $firstHash = (Get-FileHash -LiteralPath $first.FullName -Algorithm SHA256).Hash
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check (@(Get-Manifests $base).Count -eq 2) 'two manifests exist'
+    Check ((Get-FileHash -LiteralPath $first.FullName -Algorithm SHA256).Hash -eq $firstHash) 'the first manifest is unchanged'
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
+
+    Start-Case 'normal run without a data directory: nothing is left in the data path'
+    $base = New-Base 'no-original' $false
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty again'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory'
+
+    Start-Case 'a failing scenario: the original comes back'
+    $base = New-Base 'scenario-fault'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'scenario')
+    Check ($code -eq 1) "exit code 1, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+
+    # ---------------------------------------------------------------------------
+    # A step of Enter-Isolation fails
+    # ---------------------------------------------------------------------------
+
+    foreach ($fault in @(
+            @{ Name = 'manifest-write'; Code = 2; Moved = $false },
+            @{ Name = 'stage-create'; Code = 1; Moved = $false },
+            @{ Name = 'sentinel-write'; Code = 1; Moved = $false },
+            @{ Name = 'backup-rename'; Code = 1; Moved = $false },
+            @{ Name = 'backup-verify'; Code = 1; Moved = $true },
+            @{ Name = 'stage-move'; Code = 1; Moved = $true })) {
+        Start-Case "fault '$($fault.Name)': the original is in its place afterwards"
+        $base = New-Base "fault-$($fault.Name)"
+        $before = Get-Snapshot (Get-Root $base)
+        $code = Invoke-Check $base @('-TestFault', $fault.Name)
+        Check ($code -eq $fault.Code) "exit code $($fault.Code), got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged and in its place'
+        Check (-not (Test-IsTestDir (Get-Root $base))) 'the data path does not hold a test directory'
+        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+        $output = Get-LastOutput
+        Check ($output -match 'original path restored:\s+yes') 'the outcome says where the original is'
+        Check ($output -match 'test copy:') 'the outcome says where the test copy is'
+        Check ($output -match 'manual steps:\s+none') 'no manual step is asked for'
+        $again = Invoke-Check $base @('-RestoreOnly')
+        Check ($again -eq 0) "-RestoreOnly afterwards: exit code 0, got $again"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) '-RestoreOnly afterwards changes nothing'
+    }
+
+    Start-Case "fault 'sentinel-write' without a data directory: no unmarked directory in the data path"
+    $base = New-Base 'fault-sentinel-no-original' $false
+    $code = Invoke-Check $base @('-TestFault', 'sentinel-write')
+    Check ($code -eq 1) "exit code 1, got $code"
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path stays empty'
+
+    # ---------------------------------------------------------------------------
+    # A step of the restore fails
+    # ---------------------------------------------------------------------------
+
+    Start-Case "fault 'test-root-move': the test directory is renamed aside, the original comes back"
+    $base = New-Base 'fault-test-root-move'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'test-root-move')
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
+    $aside = @(Get-ChildItem -LiteralPath (Get-Local $base) -Directory -Force | Where-Object { $_.Name.EndsWith('-aside') })
+    Check ($aside.Count -eq 1 -and (Test-IsTestDir $aside[0].FullName)) 'the test directory lies aside with its sentinel'
+
+    Start-Case 'the test directory cannot be moved at all: stop, backup intact, then -RestoreOnly'
+    $base = New-Base 'fault-test-root-stuck'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'test-root-move,test-root-aside')
+    Check ($code -eq 3) "exit code 3, got $code"
+    $backups = @(Get-Backups $base)
+    Check ($backups.Count -eq 1) 'exactly one backup directory'
+    if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
+    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is still in the data path'
+    $output = Get-LastOutput
+    Check ($output -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
+    Check ($output -match 'manual steps:\s+see ') 'the outcome points at the instructions'
+    Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt').Count -ge 1) 'the instructions are written'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) '-RestoreOnly brings the original back unchanged'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the second -RestoreOnly changes nothing'
+
+    Start-Case "fault 'backup-restore': stop, backup intact, then -RestoreOnly"
+    $base = New-Base 'fault-backup-restore'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'backup-restore')
+    Check ($code -eq 3) "exit code 3, got $code"
+    $backups = @(Get-Backups $base)
+    Check ($backups.Count -eq 1) 'exactly one backup directory'
+    if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty (the test directory was moved away)'
+    Check ((Get-LastOutput) -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'backup-restore')
+    Check ($code -eq 3) "-RestoreOnly that fails too: exit code 3, got $code"
+    $backups = @(Get-Backups $base)
+    Check ($backups.Count -eq 1 -and (Get-Snapshot $backups[0].FullName) -eq $before) 'the backup is still intact'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
+
+    # ---------------------------------------------------------------------------
+    # Interrupted runs and -RestoreOnly
+    # ---------------------------------------------------------------------------
+
+    Start-Case 'interrupted after the isolation: a new run refuses, -RestoreOnly restores, twice is safe'
+    $base = New-Base 'interrupted'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'crash-after-isolation')
+    Check ($code -eq 99) "the interrupted run ends with 99, got $code"
+    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is in the data path'
+    Check (@(Get-Backups $base).Count -eq 1) 'one backup directory'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a new run refuses with 3 (the data is not in its place), got $code"
+    Check ((Get-LastOutput) -match 'run the script with -RestoreOnly') 'the refusal points at -RestoreOnly'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved nothing'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is unchanged after it'
+
+    Start-Case 'interrupted right after the rename: only a backup exists, -RestoreOnly restores'
+    $base = New-Base 'only-backup'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'crash-after-backup')
+    Check ($code -eq 99) "the interrupted run ends with 99, got $code"
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty'
+    Check (@(Get-Backups $base).Count -eq 1) 'one backup directory'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
+
+    Start-Case 'only a test directory (there was no data directory): -RestoreOnly moves it away'
+    $base = New-InterruptedBase 'only-test-root' $false
+    Check (Test-IsTestDir (Get-Root $base)) 'the test directory is in the data path'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is empty again'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
+
+    Start-Case 'only a test directory, but its manifest names a backup that is gone: stop'
+    $base = New-InterruptedBase 'test-root-backup-gone'
+    $elsewhere = Join-Path $base 'moved-by-the-test'
+    Move-Item -LiteralPath (Get-Backups $base)[0].FullName -Destination $elsewhere
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'no backup directory is there') 'the reason is named'
+
+    Start-Case 'backup and test directory from different runs: stop, nothing moved'
+    $base = New-InterruptedBase 'different-runs'
+    $sentinel = Join-Path (Get-Root $base) $SentinelName
+    $other = [guid]::NewGuid().ToString('N')
+    [System.IO.File]::WriteAllLines($sentinel, @('Test directory', "run_id=$other"))
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'different runs') 'the reason is named'
+
+    Start-Case 'the sentinel of the test directory is damaged: stop, nothing moved'
+    $base = New-InterruptedBase 'damaged-sentinel'
+    [System.IO.File]::WriteAllText((Join-Path (Get-Root $base) $SentinelName), 'garbage')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+
+    Start-Case 'several backups: stop, nothing moved, no guess'
+    $base = New-InterruptedBase 'several-backups'
+    $second = Join-Path (Get-Local $base) "$AppId.sqlite-check-backup-20260101-000000-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $second | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $second 'file'), 'another backup')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'more than one backup') 'the reason is named'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a normal run refuses with 3 (the data is not in its place), got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
+
+    Start-Case 'the manifest is missing: stop; put back: restore'
+    $base = New-InterruptedBase 'manifest-missing'
+    $manifest = (Get-Manifests $base)[0].FullName
+    $kept = Join-Path $base 'manifest-kept-by-the-test.txt'
+    Move-Item -LiteralPath $manifest -Destination $kept
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'is missing') 'the reason is named'
+    Move-Item -LiteralPath $kept -Destination $manifest
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "with the manifest back: exit code 0, got $code"
+    Check (-not (Test-IsTestDir (Get-Root $base)) -and (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'))) 'the original is back'
+
+    Start-Case 'the manifest is damaged: stop, nothing moved'
+    $base = New-InterruptedBase 'manifest-damaged'
+    $manifest = (Get-Manifests $base)[0].FullName
+    $text = [System.IO.File]::ReadAllText($manifest)
+    [System.IO.File]::WriteAllText($manifest, ($text -replace 'entries=\d+', 'entries=1'))
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'damaged') 'the reason is named'
+
+    Start-Case 'the manifest is cut short: stop, nothing moved'
+    $base = New-InterruptedBase 'manifest-truncated'
+    $manifest = (Get-Manifests $base)[0].FullName
+    [System.IO.File]::WriteAllText($manifest, 'format=1')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+
+    Start-Case 'the backup no longer matches its manifest: stop; when it matches again: restore'
+    $base = New-InterruptedBase 'backup-changed'
+    $extra = Join-Path (Get-Backups $base)[0].FullName 'added-by-the-test.txt'
+    [System.IO.File]::WriteAllText($extra, 'x')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'does not match the fingerprint') 'the reason is named'
+    Remove-Item -LiteralPath $extra
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "when it matches again: exit code 0, got $code"
+
+    Start-Case 'the data path is occupied by a directory without a sentinel: stop, nothing moved'
+    $base = New-InterruptedBase 'occupied'
+    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'it may be data') 'the reason is named'
+
+    Start-Case 'a backup made by an older version of the script (no run id): stop, nothing moved'
+    $base = New-Base 'old-backup' $false
+    $old = Join-Path (Get-Local $base) "$AppId.sqlite-check-backup-20261115-190917"
+    New-Item -ItemType Directory -Path $old | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $old 'file'), 'data')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a normal run refuses with 3 (the data is not in its place), got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run moved nothing'
+
+    Start-Case '-RestoreOnly with nothing to restore: exit 0, nothing moved'
+    $base = New-Base 'nothing-to-restore'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+
+    # ---------------------------------------------------------------------------
+    # Processes
+    # ---------------------------------------------------------------------------
+
+    function Set-Processes([string]$Base, [string[]]$Lines) {
+        [System.IO.File]::WriteAllLines((Join-Path $Base 'processes.txt'), $Lines)
+    }
+
+    foreach ($entry in @(
+            @{ Name = 'ATLAS is running'; Lines = @('100|atlas.exe|C:\x\atlas.exe'); Pattern = 'ATLAS is running' },
+            @{ Name = 'the installed ATLAS.exe is running'; Lines = @('100|ATLAS.exe|C:\Program Files\ATLAS\ATLAS.exe'); Pattern = 'ATLAS is running' },
+            @{ Name = 'a WebView2 process of ATLAS (by the executable name) is left'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe'); Pattern = 'WebView2 processes of ATLAS' },
+            @{ Name = 'a WebView2 process with an unreadable command line'; Lines = @('300|msedgewebview2.exe|<unreadable>'); Pattern = 'cannot be told whose' })) {
+        Start-Case "processes: $($entry.Name) -> refuse before any change"
+        $base = New-Base ("proc-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        Set-Processes $base $entry.Lines
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @()
+        Check ($code -eq 2) "exit code 2, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+        Check ((Get-LastOutput) -match $entry.Pattern) 'the reason is named'
+    }
+
+    Start-Case 'processes: a WebView2 process that names the data directory -> refuse'
+    $base = New-Base 'proc-by-directory'
+    Set-Processes $base @("200|msedgewebview2.exe|msedgewebview2.exe --user-data-dir=`"$(Get-Root $base)\EBWebView`" --type=gpu-process")
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 2) "exit code 2, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    Start-Case 'processes: WebView2 of another application and unrelated processes -> the run goes on'
+    $base = New-Base 'proc-foreign'
+    $before = Get-Snapshot (Get-Root $base)
+    Set-Processes $base @(
+        '400|msedgewebview2.exe|msedgewebview2.exe --webview-exe-name=Teams.exe --user-data-dir="C:\Users\u\AppData\Local\Teams\EBWebView"',
+        '401|explorer.exe|C:\Windows\explorer.exe',
+        '402|atlas-helper.exe|C:\other\atlas-helper.exe')
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged'
+
+    Start-Case 'processes: ATLAS is running during -RestoreOnly -> stop, nothing moved; afterwards restore'
+    $base = New-InterruptedBase 'proc-restore'
+    Set-Processes $base @('100|atlas.exe|C:\x\atlas.exe')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Remove-Item -LiteralPath (Join-Path $base 'processes.txt')
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "after ATLAS was closed: exit code 0, got $code"
+
+    # ---------------------------------------------------------------------------
+    # Processes that are still there when the run wants to restore
+    # ---------------------------------------------------------------------------
+
+    # processes-after-scenario.txt becomes the process list once the (imitated)
+    # scenario has run: what a run of the application can leave behind.
+    foreach ($entry in @(
+            @{ Name = 'a WebView2 process with an unreadable command line stays'; Lines = @('300|msedgewebview2.exe|<unreadable>'); Pattern = 'owner unknown' },
+            @{ Name = 'a WebView2 process of ATLAS stays'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe'); Pattern = 'msedgewebview2\.exe \(id 200\)' },
+            @{ Name = 'the application itself stays'; Lines = @('100|atlas.exe|C:\x\atlas.exe'); Pattern = 'atlas\.exe \(id 100\)' },
+            @{ Name = 'the process list cannot be read'; Lines = @('!error'); Pattern = 'list of processes cannot be read' })) {
+        Start-Case "after the scenario $($entry.Name): nothing is moved, exit 3; -RestoreOnly restores once it is gone"
+        $base = New-Base ("after-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $before = Get-Snapshot (Get-Root $base)
+        [System.IO.File]::WriteAllLines((Join-Path $base 'processes-after-scenario.txt'), $entry.Lines)
+        $code = Invoke-Check $base @()
+        Check ($code -eq 3) "exit code 3, got $code"
+        $output = Get-LastOutput
+        Check ($output -match 'cannot be confirmed that every ATLAS and WebView2 process has ended') 'the end of ATLAS is reported as not confirmed'
+        Check ($output -match $entry.Pattern) 'what is still running is named'
+        Check ($output -match 'original path restored:\s+NO') 'the outcome says the path is NOT restored'
+        Check ($output -notmatch 'Test directory moved|Original data directory restored') 'nothing was moved or restored'
+        Check (Test-IsTestDir (Get-Root $base)) 'the test directory is still in the data path'
+        $backups = @(Get-Backups $base)
+        Check ($backups.Count -eq 1) 'exactly one backup directory'
+        if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
+        Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Force -Filter $SentinelName).Count -eq 0) 'no test directory was taken into the report'
+        Check (@(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt').Count -ge 1) 'the instructions are written'
+        # Still there: -RestoreOnly must not move anything either.
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 3) "-RestoreOnly while it is still there: exit code 3, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly while it is still there moved nothing'
+        # Gone.
+        Remove-Item -LiteralPath (Join-Path $base 'processes.txt') -Force
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "-RestoreOnly after it is gone: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
+        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved nothing'
+    }
+
+    Start-Case 'the process list cannot be read during -RestoreOnly: stop, nothing moved; afterwards restore'
+    $base = New-InterruptedBase 'proc-list-error'
+    Set-Processes $base @('!error')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    Check ((Get-LastOutput) -match 'list of processes cannot be read') 'the reason is named'
+    Remove-Item -LiteralPath (Join-Path $base 'processes.txt') -Force
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "afterwards: exit code 0, got $code"
+
+    Start-Case 'the process list cannot be read before the run: refuse before any change'
+    $base = New-Base 'proc-list-error-start'
+    Set-Processes $base @('!error')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 2) "exit code 2, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    # ---------------------------------------------------------------------------
+    # The backups cannot be listed
+    # ---------------------------------------------------------------------------
+
+    Start-Case 'the backups cannot be listed during -RestoreOnly: a refusal, not "nothing to restore"'
+    $base = New-InterruptedBase 'list-error-restore'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'list-backups')
+    Check ($code -eq 3) "exit code 3, got $code"
+    $output = Get-LastOutput
+    Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+    Check ($output -match 'cannot be listed') 'the reason is named'
+    Check ($output -match 'original path restored:\s+NO') 'the outcome does not claim the data is in place'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "once the listing works: exit code 0, got $code"
+    Check (-not (Test-IsTestDir (Get-Root $base)) -and @(Get-Backups $base).Count -eq 0) 'the original is back'
+
+    Start-Case 'the backups cannot be listed and there is nothing to restore: still a refusal'
+    $base = New-Base 'list-error-clean'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'list-backups')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+
+    Start-Case 'the backups cannot be listed before a run: refuse, nothing changed, no claim that the data is in place'
+    $base = New-Base 'list-error-start'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-TestFault', 'list-backups')
+    Check ($code -eq 3) "exit code 3 (the state could not be checked), got $code"
+    $output = Get-LastOutput
+    Check ($output -match 'cannot be listed') 'the reason is named'
+    Check ($output -match 'original path restored:\s+NO') 'the outcome does not claim the data is in place'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    # ---------------------------------------------------------------------------
+    # The backup changes between its first check and the restore
+    # ---------------------------------------------------------------------------
+
+    Start-Case 'the backup changes during the run: the restore stops before the backup is moved; then -RestoreOnly'
+    $base = New-Base 'tamper-run'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'tamper-backup')
+    Check ($code -eq 3) "exit code 3, got $code"
+    $output = Get-LastOutput
+    Check ($output -match 'does not match the fingerprint') 'the reason is named'
+    Check ($output -match 'it was not moved') 'it says the backup was not moved'
+    Check ($output -notmatch 'Original data directory restored') 'nothing was restored'
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is not occupied'
+    $backups = @(Get-Backups $base)
+    Check ($backups.Count -eq 1) 'the backup is where it was'
+    if ($backups.Count -eq 1) {
+        $added = Join-Path $backups[0].FullName 'added-by-the-fault.txt'
+        Check (Test-Path -LiteralPath $added) 'the change is in the backup'
+        # Still changed: -RestoreOnly refuses too.
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 3) "-RestoreOnly while it is changed: exit code 3, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly while it is changed moved nothing'
+        Remove-Item -LiteralPath $added -Force
+        Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'without the change the backup holds the original data'
+    }
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly after the change is undone: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original is back unchanged'
+
+    Start-Case 'the backup changes between the check of -RestoreOnly and its rename: stop before the move'
+    $base = New-InterruptedBase 'tamper-restore'
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'tamper-backup')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-LastOutput) -match 'it was not moved') 'it says the backup was not moved'
+    Check (-not (Test-Path -LiteralPath (Get-Root $base))) 'the data path is not occupied by the backup'
+    $backups = @(Get-Backups $base)
+    Check ($backups.Count -eq 1) 'the backup is where it was'
+    if ($backups.Count -eq 1) { Remove-Item -LiteralPath (Join-Path $backups[0].FullName 'added-by-the-fault.txt') -Force }
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly after the change is undone: exit code 0, got $code"
+    Check ((Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db')) -and @(Get-Backups $base).Count -eq 0) 'the original is back'
+
+    # ---------------------------------------------------------------------------
+    # Group A: the sentinel of the installed test directory is lost
+    # ---------------------------------------------------------------------------
+
+    function Get-RunIds([string]$Base) {
+        return @(Get-Manifests $Base | ForEach-Object { $_.BaseName.Substring('manifest-'.Length) })
+    }
+
+    function Get-Instructions([string]$Base) {
+        $text = ''
+        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt')) {
+            $text += [System.IO.File]::ReadAllText($file.FullName)
+        }
+        return $text
+    }
+
+    # The command the instructions give to close run $Id by hand, as written
+    # into RESTORE-INSTRUCTIONS.txt, or '' when there is none.
+    function Get-ManualCloseCommand([string]$Base, [string]$Id) {
+        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt' | Sort-Object LastWriteTime -Descending)) {
+            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+                if ($line.Contains('WriteAllLines(') -and $line.Contains("'$Id'")) { return $line.Trim() }
+            }
+        }
+        return ''
+    }
+
+    # Runs that command, exactly as a user would paste it.
+    function Invoke-ManualClose([string]$Base, [string]$Id) {
+        $command = Get-ManualCloseCommand $Base $Id
+        Check ($command -ne '') 'the instructions give a command that closes the run by hand'
+        Check ($command -notmatch 'New-Item') 'the command does not create an empty file'
+        if ($command -ne '') { Invoke-Expression $command }
+    }
+
+    function Get-DonePath([string]$Base, [string]$Id) { return (Join-Path (Get-StateDir $Base) "done-$Id.txt") }
+
+    function Get-TempMarkers([string]$Base) {
+        $state = Get-StateDir $Base
+        if (-not (Test-Path -LiteralPath $state)) { return @() }
+        return @(Get-ChildItem -LiteralPath $state -Force | Where-Object { $_.Name.StartsWith('tmp-done-') })
+    }
+
+    function Get-ManifestHashes([string]$Base) {
+        return (@(Get-Manifests $Base | Sort-Object Name | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',')
+    }
+
+    function Test-Done([string]$Base, [string]$Id) {
+        return (Test-Path -LiteralPath (Join-Path (Get-StateDir $Base) "done-$Id.txt"))
+    }
+
+    # What every case of this group must show after a stop.
+    function Check-SentinelStop([string]$Base, [int]$Code, [string]$Id, [string]$ManifestHashes) {
+        $output = Get-LastOutput
+        Check ($Code -eq 3) "exit code 3, got $Code"
+        Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+        Check ($output -match 'original path restored:\s+NO') 'the data path is not reported as restored'
+        Check ($output -notmatch 'Test directory moved|Test directory renamed|Original data directory restored') 'nothing was moved or restored'
+        Check (Test-Path -LiteralPath (Get-Root $Base) -PathType Container) 'the unknown directory is still in the data path'
+        Check ((Get-ManifestHashes $Base) -eq $ManifestHashes) 'the manifest is unchanged'
+        Check (-not (Test-Done $Base $Id)) 'the run is not marked as finished'
+        $instructions = Get-Instructions $Base
+        Check ($instructions.Contains($Id)) 'the instructions name the run id'
+        Check ($instructions.Contains((Get-Root $Base))) 'the instructions name the data path'
+        Check ($instructions -match 'NOT moved, deleted or overwritten') 'the instructions say what is not moved automatically'
+    }
+
+    foreach ($entry in @(
+            @{ Name = 'removed'; Fault = 'drop-sentinel'; Original = $false },
+            @{ Name = 'damaged'; Fault = 'damage-sentinel'; Original = $false },
+            @{ Name = 'removed'; Fault = 'drop-sentinel'; Original = $true },
+            @{ Name = 'damaged'; Fault = 'damage-sentinel'; Original = $true })) {
+        $kind = 'no data directory before the run'
+        if ($entry.Original) { $kind = 'data directory and backup' }
+        Start-Case "A: $kind, test directory installed, sentinel $($entry.Name): stop, nothing moved; resolved by hand, then -RestoreOnly"
+        $base = New-Base ("sentinel-" + [guid]::NewGuid().ToString('N').Substring(0, 8)) $entry.Original
+        $before = '<absent>'
+        if ($entry.Original) { $before = Get-Snapshot (Get-Root $base) }
+        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
+        $id = @(Get-RunIds $base)[0]
+        $hashes = Get-ManifestHashes $base
+        Check-SentinelStop $base $code $id $hashes
+        $unknown = Get-Snapshot (Get-Root $base)
+        $backups = @(Get-Backups $base)
+        if ($entry.Original) {
+            Check ($backups.Count -eq 1) 'exactly one backup directory'
+            if ($backups.Count -eq 1) { Check ((Get-Snapshot $backups[0].FullName) -eq $before) 'the backup holds the original data unchanged' }
+        } else {
+            Check ($backups.Count -eq 0) 'no backup directory (there was no data directory)'
+        }
+        # -RestoreOnly cannot decide either.
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check-SentinelStop $base $code $id $hashes
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly moved nothing'
+        # A new run must not take the unknown directory for the data of the user.
+        $code = Invoke-Check $base @()
+        Check ($code -eq 3) "a new run refuses with 3, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
+        Check ((Get-Snapshot (Get-Root $base)) -eq $unknown) 'the unknown directory was not overwritten'
+        # By hand: the user looks into the directory and moves it away.
+        Move-Item -LiteralPath (Get-Root $base) -Destination (Join-Path $base 'moved-away-by-hand')
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "-RestoreOnly after the directory was moved away by hand: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds exactly what was there before the run'
+        Check (@(Get-Backups $base).Count -eq 0) 'no backup directory is left'
+        Check (Test-Done $base $id) 'the run is marked as finished'
+        Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is still unchanged'
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "second -RestoreOnly: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly changed nothing'
+        $code = Invoke-Check $base @()
+        Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'and leaves the data path as it was'
+    }
+
+    Start-Case 'A: interrupted run without a data directory, sentinel removed afterwards: -RestoreOnly does not say "nothing to restore"'
+    $base = New-InterruptedBase 'sentinel-interrupted' $false
+    $id = @(Get-RunIds $base)[0]
+    $hashes = Get-ManifestHashes $base
+    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check-SentinelStop $base $code $id $hashes
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+
+    Start-Case 'A: the manifest says the test directory was installed, but the data path holds an unknown directory: stop; acknowledged by hand'
+    $base = New-InterruptedBase 'unknown-directory' $false
+    $id = @(Get-RunIds $base)[0]
+    $hashes = Get-ManifestHashes $base
+    Move-Item -LiteralPath (Get-Root $base) -Destination (Join-Path $base 'test-dir-taken-out-by-the-test')
+    New-Item -ItemType Directory -Path (Join-Path (Get-Root $base) 'data') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'), 'data that appeared later')
+    $unknown = Get-Snapshot (Get-Root $base)
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check-SentinelStop $base $code $id $hashes
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a new run refuses with 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
+    # An empty "done" file, the old way to close a run, is not accepted any more.
+    $empty = Join-Path (Get-StateDir $base) "done-$id.txt"
+    New-Item -ItemType File -Path $empty | Out-Null
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "an empty done file does not close the run: exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved and the empty file was not changed'
+    Remove-Item -LiteralPath $empty -Force
+    # By hand: the user decides that the directory is data and closes the run with the command of the instructions.
+    Invoke-ManualClose $base $id
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly after the run was closed by hand: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $unknown) 'the directory in the data path was not touched'
+
+    Start-Case 'A: a truly clean state still means "nothing to restore"'
+    $base = New-Base 'clean-state'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-LastOutput) -match 'Nothing to restore') 'it says "nothing to restore"'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    Start-Case "A: fault 'touched-write': the data path was not touched"
+    $base = New-Base 'fault-touched-write'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'touched-write')
+    Check ($code -eq 1) "exit code 1, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the original data is unchanged and in its place'
+    Check (@(Get-Backups $base).Count -eq 0) 'no backup directory'
+
+    # ---------------------------------------------------------------------------
+    # Group B: the check after the rename back does not pass
+    # ---------------------------------------------------------------------------
+
+    # What every case of this group must show after the failed second check.
+    function Check-UnconfirmedRestore([string]$Base, [int]$Code, [string]$Id) {
+        $output = Get-LastOutput
+        Check ($Code -eq 3) "exit code 3, got $Code"
+        Check ($output -match 'original path restored:\s+NO') 'the restore is not reported as confirmed'
+        Check ($output -match 'fingerprint NOT confirmed') 'the outcome says where the data is and that it is not confirmed'
+        Check ($output -notmatch 'Original data directory restored') 'it does not say "restored"'
+        Check (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $Base) 'data') 'atlas.db')) 'the directory really is in the data path'
+        Check (@(Get-Backups $Base).Count -eq 0) 'no backup directory is left (it was renamed back)'
+        Check (-not (Test-Done $Base $Id)) 'the run is not marked as finished'
+        $instructions = Get-Instructions $Base
+        Check ($instructions -match 'ALREADY renamed back') 'the instructions say the directory is already in the data path'
+        Check ($instructions -match 'NOT confirmed') 'the instructions say the restore is not confirmed'
+        Check ($instructions.Contains($Id)) 'the instructions name the run id'
+    }
+
+    Start-Case 'B: the directory differs after the rename back: restore fails with 3; -RestoreOnly overwrites nothing; fixed by hand'
+    $base = New-Base 'postcheck-mismatch'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'tamper-after-restore')
+    $id = @(Get-RunIds $base)[0]
+    $hashes = Get-ManifestHashes $base
+    Check-UnconfirmedRestore $base $code $id
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
+    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) '-RestoreOnly moved and overwrote nothing'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a new run refuses with 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
+    # By hand: the user removes what does not belong there.
+    Remove-Item -LiteralPath (Join-Path (Get-Root $base) 'added-after-restore.txt') -Force
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly after the fix: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
+    Check (Test-Done $base $id) 'the run is marked as finished'
+    Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is unchanged'
+
+    Start-Case 'B: the check after the rename back cannot be done: restore fails with 3; a later -RestoreOnly confirms it'
+    $base = New-Base 'postcheck-error'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'postcheck-error')
+    $id = @(Get-RunIds $base)[0]
+    Check-UnconfirmedRestore $base $code $id
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the contents in the data path are the original ones'
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'postcheck-error')
+    Check ($code -eq 0 -or $code -eq 3) "a second -RestoreOnly ends with 0 or 3, got $code"
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
+    Check (Test-Done $base $id) 'the run is marked as finished'
+
+    foreach ($entry in @(
+            @{ Name = 'interrupted after the isolation'; Fault = 'crash-after-isolation' },
+            @{ Name = 'interrupted right after the rename'; Fault = 'crash-after-backup' })) {
+        Start-Case "B: -RestoreOnly ($($entry.Name)) meets the failed second check: 3, then no overwrite, then fixed by hand"
+        $base = New-Base ("postcheck-restore-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $before = Get-Snapshot (Get-Root $base)
+        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
+        Check ($code -eq 99) "setup: the interrupted run ends with 99, got $code"
+        $id = @(Get-RunIds $base)[0]
+        $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'tamper-after-restore')
+        Check-UnconfirmedRestore $base $code $id
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 3) "second -RestoreOnly: exit code 3, got $code"
+        Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the second -RestoreOnly moved and overwrote nothing'
+        Remove-Item -LiteralPath (Join-Path (Get-Root $base) 'added-after-restore.txt') -Force
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "-RestoreOnly after the fix: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data path holds the original data unchanged'
+    }
+
+    # ---------------------------------------------------------------------------
+    # Group C: the "done" marker
+    # ---------------------------------------------------------------------------
+
+    function Get-ValidDoneLines([string]$Id) {
+        return @('format=atlas-sqlite-check-marker-1', 'kind=done', "run_id=$Id", 'written=20261116-093000', "end=$Id")
+    }
+
+    Start-Case 'C: the marker the script writes is whole, and a finished run stays finished'
+    $base = New-Base 'done-own'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "exit code 0, got $code"
+    $id = @(Get-RunIds $base)[0]
+    $done = Get-DonePath $base $id
+    Check (Test-Path -LiteralPath $done -PathType Leaf) 'the done marker exists'
+    $lines = @([System.IO.File]::ReadAllLines($done))
+    Check ($lines.Count -eq 5 -and $lines[0] -ceq 'format=atlas-sqlite-check-marker-1' -and $lines[1] -ceq 'kind=done' -and $lines[2] -ceq "run_id=$id" -and $lines[3] -cmatch '^written=\d{8}-\d{6}$' -and $lines[4] -ceq "end=$id") 'it has exactly the five documented lines'
+    Check (@(Get-TempMarkers $base).Count -eq 0) 'no temporary file is left'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the valid marker was not rewritten and nothing was moved'
+
+    $foreign = [guid]::NewGuid().ToString('N')
+    foreach ($entry in @(
+            @{ Name = 'empty'; Kind = 'lines'; Lines = @() },
+            @{ Name = 'cut short (three of five lines)'; Kind = 'cut' },
+            @{ Name = 'cut short (the last line is missing)'; Kind = 'cut4' },
+            @{ Name = 'with the run id of another run'; Kind = 'foreign' },
+            @{ Name = 'in the old two-line format'; Kind = 'old' },
+            @{ Name = 'with an extra line'; Kind = 'extra' },
+            @{ Name = 'that only contains the run id somewhere'; Kind = 'substring' },
+            @{ Name = 'that cannot be read (a directory of that name)'; Kind = 'directory' })) {
+        Start-Case "C: a done marker $($entry.Name) does not close the run: exit 3, nothing changed; replaced by hand, then fine"
+        $base = New-Base ("done-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $before = Get-Snapshot (Get-Root $base)
+        $code = Invoke-Check $base @()
+        Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
+        $id = @(Get-RunIds $base)[0]
+        $done = Get-DonePath $base $id
+        $hashes = Get-ManifestHashes $base
+        $valid = Get-ValidDoneLines $id
+        Remove-Item -LiteralPath $done -Force
+        switch ($entry.Kind) {
+            'lines' { [System.IO.File]::WriteAllLines($done, [string[]]@()) }
+            'cut' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..2])) }
+            'cut4' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..3])) }
+            'foreign' { [System.IO.File]::WriteAllLines($done, [string[]]@(Get-ValidDoneLines $foreign)) }
+            'old' { [System.IO.File]::WriteAllLines($done, [string[]]@("run_id=$id", 'written=20261116-093000')) }
+            'extra' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid + @('more=1'))) }
+            'substring' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0], $valid[1], "x run_id=$id y", $valid[3], $valid[4])) }
+            'directory' { New-Item -ItemType Directory -Path $done | Out-Null }
+        }
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-RestoreOnly')
+        $output = Get-LastOutput
+        Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
+        Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+        Check ($output -match 'not a valid "done" marker') 'the invalid marker is reported'
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the marker was not changed and nothing was moved'
+        $instructions = Get-Instructions $base
+        Check ($instructions.Contains($done)) 'the instructions name the exact path of the marker'
+        Check ($instructions.Contains($id)) 'the instructions name the run id'
+        Check ($instructions -match 'repairs nothing and restores nothing') 'the instructions say what the marker does not do'
+        Check ($instructions -match 'do NOT create the marker') 'the instructions say when not to create it'
+        Check ($instructions -notmatch 'New-Item -ItemType File') 'the instructions do not offer an empty file'
+        # A new run and a second -RestoreOnly: the same, still nothing changed.
+        $code = Invoke-Check $base @()
+        Check ($code -eq 3) "a new run refuses with 3, got $code"
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 3) "second -RestoreOnly: exit code 3, got $code"
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'still nothing was changed'
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+        Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is unchanged'
+        # By hand, as the instructions say: the invalid file aside, the whole marker in its place.
+        Rename-Item -LiteralPath $done -NewName ("invalid-" + (Split-Path -Leaf $done))
+        Invoke-ManualClose $base $id
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "-RestoreOnly after the marker was replaced by hand: exit code 0, got $code"
+        $code = Invoke-Check $base @()
+        Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+    }
+
+    Start-Case 'C: an invalid done marker while a backup and a test directory wait: nothing is moved; without it the restore goes on'
+    $base = New-InterruptedBase 'done-pending'
+    $id = @(Get-RunIds $base)[0]
+    $done = Get-DonePath $base $id
+    [System.IO.File]::WriteAllText($done, '')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-LastOutput) -notmatch 'Test directory moved|Original data directory restored') 'neither the test directory nor the backup was moved'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+    Check (@(Get-Backups $base).Count -eq 1 -and (Test-IsTestDir (Get-Root $base))) 'the backup and the test directory are where they were'
+    Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
+    Check (@(Get-Backups $base).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'))) 'the original is back'
+    Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the script wrote the whole marker itself'
+
+    Start-Case 'C: the markers cannot be read at all: a refusal'
+    $base = New-Base 'done-read-error'
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'done-read-error')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    Start-Case 'C: a file named like a done marker without a run id is reported, not ignored'
+    $base = New-Base 'done-no-id'
+    $code = Invoke-Check $base @()
+    $stray = Join-Path (Get-StateDir $base) 'done-run id.txt'
+    [System.IO.File]::WriteAllText($stray, 'x')
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+    Start-Case 'C: a temporary marker file that was left behind does not close the run'
+    $base = New-InterruptedBase 'done-temp-left' $false
+    $id = @(Get-RunIds $base)[0]
+    Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
+    $temp = Join-Path (Get-StateDir $base) "tmp-done-$id-$([guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllLines($temp, [string[]]@(Get-ValidDoneLines $id))
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check (-not (Test-Path -LiteralPath (Get-DonePath $base $id))) 'no done marker appeared'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the temporary file was neither used nor deleted, nothing was moved'
+
+    foreach ($entry in @(
+            @{ Name = 'the temporary file cannot be written'; Fault = 'done-temp-write'; Temp = 0 },
+            @{ Name = 'the temporary file is written only in part'; Fault = 'done-temp-partial'; Temp = 1 },
+            @{ Name = 'the rename into place fails'; Fault = 'done-rename'; Temp = 1 })) {
+        Start-Case "C: $($entry.Name): no done marker, exit 3; a later -RestoreOnly closes the run"
+        $base = New-Base ("done-w-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $before = Get-Snapshot (Get-Root $base)
+        $code = Invoke-Check $base @('-TestFault', $entry.Fault)
+        $id = @(Get-RunIds $base)[0]
+        $done = Get-DonePath $base $id
+        Check ($code -eq 3) "exit code 3 (the run is not confirmed as finished), got $code"
+        Check (-not (Test-Path -LiteralPath $done)) 'no done marker exists'
+        Check (@(Get-TempMarkers $base).Count -eq $entry.Temp) "temporary files left: $($entry.Temp) (they are not deleted)"
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is in its place and unchanged'
+        Check ((Get-LastOutput) -match 'could not be marked as finished') 'the reason is named'
+        $temps = @(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ','
+        $code = Invoke-Check $base @('-RestoreOnly')
+        Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+        Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the whole done marker is written now'
+        Check ((@(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',') -eq $temps) 'the old temporary files are still there, unchanged, and no new one is left'
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+    }
+
+    Start-Case 'C: a file that takes the final name at the last moment is never overwritten'
+    $base = New-Base 'done-final-appears'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', 'done-final-appears')
+    $id = @(Get-RunIds $base)[0]
+    $done = Get-DonePath $base $id
+    Check ($code -eq 3) "exit code 3, got $code"
+    Check (([System.IO.File]::ReadAllText($done)) -eq 'not written by this run') 'the file that was there first is unchanged'
+    Check (@(Get-TempMarkers $base).Count -eq 1) 'the temporary file stays'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "-RestoreOnly: exit code 3 (the file is not a valid marker), got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+    Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
+
+    # ---------------------------------------------------------------------------
+    # Group D: finding the application, without paths of the repository
+    # ---------------------------------------------------------------------------
+
+    # A stand-in for the application, at a path below the test profile.
+    function New-FakeExe([string]$Base, [string]$Relative) {
+        $path = Join-Path $Base $Relative
+        if (-not $OnWindows) { $path = $path -replace '\\', '/' -replace '\.exe$', '' }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        [System.IO.File]::WriteAllText($path, 'not really ATLAS')
+        return $path
+    }
+
+    # What a refusal before any change must show.
+    function Check-EarlyStop([string]$Base, [int]$Code, [string]$State, [string]$Pattern) {
+        Check ($Code -eq 2) "exit code 2, got $Code"
+        Check ((Get-Snapshot (Get-Local $Base)) -eq $State) 'nothing was changed'
+        Check (@(Get-Manifests $Base).Count -eq 0) 'no manifest was written'
+        $runs = @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'run.txt')
+        $text = ''
+        foreach ($file in $runs) { $text += [System.IO.File]::ReadAllText($file.FullName) }
+        Check ($text -match 'STOPPED before any change') 'the stop is written to run.txt'
+        Check ($text -match $Pattern) 'the reason is written to run.txt'
+        Check ((Get-LastOutput) -match 'original path restored:\s+yes') 'the outcome says the data is in its place'
+    }
+
+    Start-Case 'D: -Exe that does not exist: refuse before any change, the reason is in the report'
+    $base = New-Base 'exe-missing'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-Exe', (Join-Path $base 'nowhere\atlas.exe'))
+    Check-EarlyStop $base $code $state 'does not exist'
+
+    Start-Case 'D: no -Exe and nothing found: refuse before any change, the places searched are listed'
+    $base = New-Base 'exe-none'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
+    Check-EarlyStop $base $code $state 'was not found'
+    Check ((Get-LastOutput) -match 'ATLAS') 'the places searched are named'
+
+    Start-Case 'D: no -Exe and two copies found: no guess, refuse before any change'
+    $base = New-Base 'exe-two'
+    $null = New-FakeExe $base 'cwd\atlas.exe'
+    $null = New-FakeExe $base 'local\ATLAS\ATLAS.exe'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
+    Check-EarlyStop $base $code $state 'Several copies'
+
+    foreach ($entry in @(
+            @{ Name = 'a build in the current directory'; Path = 'cwd\src-tauri\target\release\atlas.exe' },
+            @{ Name = 'a copy next to the script'; Path = 'scriptdir\atlas.exe' },
+            @{ Name = 'an installed copy below %LOCALAPPDATA%'; Path = 'local\ATLAS\ATLAS.exe' },
+            @{ Name = 'an installed copy below Program Files'; Path = 'programfiles\ATLAS\ATLAS.exe' })) {
+        Start-Case "D: no -Exe, only $($entry.Name): it is used, the data comes back"
+        $base = New-Base ("exe-one-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $fake = New-FakeExe $base $entry.Path
+        $before = Get-Snapshot (Get-Root $base)
+        $code = Invoke-Check $base @('-TestFault', 'resolve-exe')
+        Check ($code -eq 0) "exit code 0, got $code"
+        Check ((Get-LastOutput).Contains("Application: $fake")) 'the copy found is named'
+        Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+    }
+
+    Start-Case 'D: environment.txt records the SHA-256 of the script itself'
+    $base = New-Base 'script-hash'
+    $code = Invoke-Check $base @()
+    $environment = ''
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'environment.txt')) { $environment += [System.IO.File]::ReadAllText($file.FullName) }
+    Check ($environment.Contains("script sha256: $((Get-FileHash -LiteralPath $Script -Algorithm SHA256).Hash)")) 'the hash is the hash of this file'
+
+    Start-Case 'D: -Exe of a file that exists: it is used and recorded with its hash'
+    $base = New-Base 'exe-given'
+    $fake = New-FakeExe $base 'elsewhere\with space\atlas.exe'
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-Exe', $fake)
+    Check ($code -eq 0) "exit code 0, got $code"
+    $environment = ''
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $base 'home') -Recurse -Filter 'environment.txt')) { $environment += [System.IO.File]::ReadAllText($file.FullName) }
+    Check ($environment.Contains("exe: $fake")) 'environment.txt names the application'
+    Check ($environment -match 'exe sha256: [0-9A-F]{64}') 'environment.txt has its hash'
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+
+    Start-Case 'D: -Build without -Source and outside a repository: refuse before any change'
+    $base = New-Base 'build-no-source'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-Build')
+    Check-EarlyStop $base $code $state 'needs a copy of the ATLAS repository'
+
+    Start-Case 'D: -Build with a -Source that does not exist: refuse before any build and any change'
+    $base = New-Base 'build-source-missing'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-Build', '-Source', (Join-Path $base 'no such folder'))
+    Check-EarlyStop $base $code $state 'not an existing directory'
+
+    # A directory with the signs of the ATLAS repository, or with one of them wrong.
+    function New-SourceTree([string]$Directory, [hashtable]$With) {
+        $o = @{ PackageName = 'atlas'; Build = $true; CargoName = 'atlas'; LibName = 'atlas_lib'; Identifier = 'com.inlerno.atlas'; ProductName = 'ATLAS' }
+        foreach ($key in $With.Keys) { $o[$key] = $With[$key] }
+        $tauriDir = Join-Path $Directory 'src-tauri'
+        New-Item -ItemType Directory -Path $tauriDir -Force | Out-Null
+        $packagePath = Join-Path $Directory 'package.json'
+        $cargoPath = Join-Path $tauriDir 'Cargo.toml'
+        $confPath = Join-Path $tauriDir 'tauri.conf.json'
+
+        $scripts = '"dev": "vite"'
+        if ($o.Build) { $scripts = '"dev": "vite", "build": "tsc && vite build", "tauri": "tauri"' }
+        $package = '{ "name": "' + $o.PackageName + '", "private": true, "version": "0.1.0", "scripts": { ' + $scripts + ' } }'
+        if ($o.ContainsKey('PackageText')) { $package = $o.PackageText }
+        if ($o.ContainsKey('PackageIsDirectory')) { New-Item -ItemType Directory -Path $packagePath | Out-Null }
+        else { [System.IO.File]::WriteAllText($packagePath, $package) }
+
+        $cargo = @('[package]', ('name = "' + $o.CargoName + '"'), 'version = "0.1.0"', 'edition = "2024"', '')
+        if ($o.LibName) { $cargo += @('[lib]', ('name = "' + $o.LibName + '"  # the library'), 'crate-type = ["staticlib", "cdylib", "rlib"]', '') }
+        $cargo += @('[dependencies]', 'tauri = { version = "2", features = [] }')
+        if ($o.ContainsKey('CargoLines')) { $cargo = $o.CargoLines }
+        if ($o.ContainsKey('CargoIsDirectory')) { New-Item -ItemType Directory -Path $cargoPath | Out-Null }
+        else { [System.IO.File]::WriteAllLines($cargoPath, [string[]]$cargo) }
+
+        $conf = '{ "$schema": "https://schema.tauri.app/config/2", "productName": "' + $o.ProductName + '", "version": "0.1.0", "identifier": "' + $o.Identifier + '", "build": { "frontendDist": "../dist" } }'
+        if ($o.ContainsKey('ConfText')) { $conf = $o.ConfText }
+        if ($o.ContainsKey('ConfIsDirectory')) { New-Item -ItemType Directory -Path $confPath | Out-Null }
+        elseif (-not $o.ContainsKey('NoConf')) { [System.IO.File]::WriteAllText($confPath, $conf) }
+    }
+
+    foreach ($entry in @(
+            @{ Name = 'minimal {} and [package] (what used to be accepted)'; With = @{ PackageText = '{}'; CargoLines = @('[package]'); NoConf = $true }; Pattern = 'package\.json: "name" is not "atlas"' },
+            @{ Name = 'another, complete Tauri project'; With = @{ PackageName = 'other-app'; CargoName = 'other-app'; LibName = 'other_app_lib'; Identifier = 'com.example.other'; ProductName = 'Other' }; Pattern = 'package\.json: "name" is not "atlas"' },
+            @{ Name = 'a wrong package name in package.json'; With = @{ PackageName = 'atlas-fork' }; Pattern = 'package\.json: "name" is not "atlas"' },
+            @{ Name = 'a package.json without a build script'; With = @{ Build = $false }; Pattern = 'there is no "build" script' },
+            @{ Name = 'a wrong package name in Cargo.toml'; With = @{ CargoName = 'not-atlas' }; Pattern = 'name in \[package\] is not "atlas"' },
+            @{ Name = 'the name "atlas" only in [dependencies]'; With = @{ CargoLines = @('[package]', 'version = "0.1.0"', '', '[lib]', 'name = "atlas_lib"', '', '[dependencies]', 'name = "atlas"') }; Pattern = 'name in \[package\] is not "atlas"' },
+            @{ Name = 'a Cargo.toml without [lib]'; With = @{ LibName = '' }; Pattern = 'name in \[lib\] is not "atlas_lib"' },
+            @{ Name = 'a wrong library name'; With = @{ LibName = 'other_lib' }; Pattern = 'name in \[lib\] is not "atlas_lib"' },
+            @{ Name = 'two names in [package]'; With = @{ CargoLines = @('[package]', 'name = "atlas"', 'name = "atlas"', '[lib]', 'name = "atlas_lib"') }; Pattern = 'two names in \[package\]' },
+            @{ Name = 'no tauri.conf.json'; With = @{ NoConf = $true }; Pattern = 'tauri\.conf\.json is missing' },
+            @{ Name = 'a wrong identifier'; With = @{ Identifier = 'com.example.atlas' }; Pattern = '"identifier" is not "com\.inlerno\.atlas"' },
+            @{ Name = 'a wrong product name'; With = @{ ProductName = 'Atlas Fork' }; Pattern = '"productName" is not "ATLAS"' },
+            @{ Name = 'a package.json that is not valid JSON'; With = @{ PackageText = '{ "name": "atlas", ' }; Pattern = 'package\.json is not valid JSON' },
+            @{ Name = 'a package.json that is a JSON array'; With = @{ PackageText = '["atlas"]' }; Pattern = 'package\.json is not a JSON object' },
+            @{ Name = 'a tauri.conf.json that is not valid JSON'; With = @{ ConfText = '{ "identifier": "com.inlerno.atlas" ' }; Pattern = 'tauri\.conf\.json is not valid JSON' },
+            @{ Name = 'a directory in the place of package.json'; With = @{ PackageIsDirectory = $true }; Pattern = 'package\.json is missing' },
+            @{ Name = 'a directory in the place of Cargo.toml'; With = @{ CargoIsDirectory = $true }; Pattern = 'Cargo\.toml is missing' },
+            @{ Name = 'a directory in the place of tauri.conf.json'; With = @{ ConfIsDirectory = $true }; Pattern = 'tauri\.conf\.json is missing' })) {
+        Start-Case "D: -Source with $($entry.Name) is refused before any build and any change"
+        $base = New-Base ("src-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $source = Join-Path $base 'some source'
+        New-SourceTree $source $entry.With
+        $sourceState = Get-Snapshot $source
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-Build', '-Source', $source)
+        Check-EarlyStop $base $code $state 'not a copy of the ATLAS repository'
+        $output = Get-LastOutput
+        Check ($output -match $entry.Pattern) 'the exact reason is named'
+        Check ($output -notmatch 'Building the application|was accepted') 'no build was started and the source was not accepted'
+        Check ((Get-Snapshot $source) -eq $sourceState) 'nothing was written into the source (no node_modules, no target)'
+    }
+
+    Start-Case 'D: a directory with all the signs of ATLAS is accepted as a source, and the tests still build nothing'
+    $base = New-Base 'src-right'
+    $right = Join-Path $base 'repo copy'
+    New-SourceTree $right @{}
+    $sourceState = Get-Snapshot $right
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-Build', '-Source', $right)
+    Check-EarlyStop $base $code $state 'was accepted'
+    Check ((Get-LastOutput) -notmatch 'Building the application') 'no build was started'
+    Check ((Get-Snapshot $right) -eq $sourceState) 'nothing was written into the source'
+
+    Start-Case 'D: the real ATLAS repository this script lies in is accepted as a source'
+    # Not a copy made by the test: the checkout itself. This file lies in
+    # <repository>\tools\windows, so the repository is two levels up. It counts
+    # as the real checkout only with what a test copy does not have: the Git
+    # metadata, this very file at its place, the CI workflow and the storage
+    # code the script checks. In GitHub Actions it must also be the workspace.
+    $checkout = ''
+    $why = ''
+    $inActions = ($env:GITHUB_ACTIONS -eq 'true')
+    $twoUp = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    if (-not $twoUp) { $why = 'the script does not lie two levels below anything' }
+    elseif ((Split-Path -Leaf $PSScriptRoot) -ne 'windows' -or (Split-Path -Leaf (Split-Path -Parent $PSScriptRoot)) -ne 'tools') { $why = "the script lies in $PSScriptRoot, not in tools\windows of a repository" }
+    else {
+        foreach ($needed in @('.git', '.github/workflows/ci.yml', 'src-tauri/src/storage/mod.rs', 'src-tauri/Cargo.lock', 'package-lock.json')) {
+            if (-not $why -and -not (Test-Path -LiteralPath (Join-Path $twoUp $needed))) { $why = "$twoUp has no $needed" }
+        }
+        if (-not $why) { $checkout = $twoUp }
+    }
+    if ($checkout -and $inActions) {
+        Check (Test-SamePathForTest $checkout $env:GITHUB_WORKSPACE) "in GitHub Actions the checkout is the workspace ($env:GITHUB_WORKSPACE)"
+    }
+    if (-not $checkout) {
+        if ($inActions) { Check $false "in GitHub Actions the real checkout must be found, and it was not: $why" }
+        else { Skip-Case "the script is not run from a checkout of ATLAS ($why)" }
+    } else {
+        $base = New-Base 'src-real'
+        $state = Get-Snapshot (Get-Local $base)
+        $code = Invoke-Check $base @('-Build', '-Source', $checkout)
+        Check-EarlyStop $base $code $state 'was accepted'
+        Check ((Get-LastOutput).Contains("the source $checkout was accepted")) 'the checkout itself is the source that was accepted'
+        Check ((Get-LastOutput) -notmatch 'Building the application') 'no build was started'
+    }
+
+    # ---------------------------------------------------------------------------
+    # Group E: the record of the profile (on temporary trees only)
+    # ---------------------------------------------------------------------------
+
+    # A folder that stands for %LOCALAPPDATA%, with a data directory, a backup
+    # and something that is not ATLAS.
+    function New-ProfileTree([string]$Name) {
+        $parent = Join-Path $Work $Name
+        $root = Join-Path $parent $AppId
+        New-Item -ItemType Directory -Path (Join-Path (Join-Path $root 'data') 'deep') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $root 'empty') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path $root 'data') 'atlas.db'), 'database')
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $root 'data') 'deep') 'nested.txt'), 'nested')
+        [System.IO.File]::WriteAllText((Join-Path $root 'storage.initialized'), 'marker')
+        $backup = Join-Path $parent "$AppId.sqlite-check-backup-x"
+        New-Item -ItemType Directory -Path $backup -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $backup 'kept.txt'), 'backup')
+        New-Item -ItemType Directory -Path (Join-Path $parent 'another.app') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path $parent 'another.app') 'file.txt'), 'not ATLAS')
+        return $parent
+    }
+
+    # The error a record ends with, or '' when it is taken.
+    function Get-SnapshotError([string]$Parent) {
+        try { $null = Get-ProfileSnapshot $Parent; return '' } catch { return "$($_.Exception.Message)" }
+    }
+
+    Start-Case 'E: the record holds nested directories and files with size and SHA-256, and nothing that is not ATLAS'
+    $tree = New-ProfileTree 'snap-nested'
+    $one = Get-ProfileSnapshot $tree
+    $expectedHash = (Get-FileHash -LiteralPath (Join-Path (Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'deep') 'nested.txt') -Algorithm SHA256).Hash
+    Check ($one.Contains("d|$AppId/data/deep")) 'a nested directory is recorded as a directory'
+    Check ($one.Contains("d|$AppId/empty")) 'an empty directory is recorded'
+    Check ($one.Contains("f|$AppId/data/deep/nested.txt|6|$expectedHash")) 'a nested file is recorded with its size and SHA-256'
+    Check ($one.Contains("f|$AppId.sqlite-check-backup-x/kept.txt|")) 'a backup directory next to the data directory is recorded'
+    Check (-not $one.Contains('another.app')) 'a folder of another application is not recorded'
+    Check ((Get-SnapshotCount $one) -eq 9) "nine objects are recorded (five directories, four files), got $(Get-SnapshotCount $one)"
+    Check ((Get-ProfileSnapshot $tree) -ceq $one) 'a second record of the same tree is the same'
+
+    Start-Case 'E: the order in which things were created does not change the record'
+    $first = Join-Path $Work 'snap-order-1'
+    $second = Join-Path $Work 'snap-order-2'
+    foreach ($name in @('a.txt', 'b.txt', 'c.txt')) {
+        New-Item -ItemType Directory -Path (Join-Path $first $AppId) -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path $first $AppId) $name), $name)
+    }
+    foreach ($name in @('c.txt', 'a.txt', 'b.txt')) {
+        New-Item -ItemType Directory -Path (Join-Path $second $AppId) -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path $second $AppId) $name), $name)
+    }
+    Check ((Get-ProfileSnapshot $first) -ceq (Get-ProfileSnapshot $second)) 'two trees with the same content give the same record'
+
+    Start-Case 'E: a change of the content of a file, with the same name and size, changes the record'
+    $tree = New-ProfileTree 'snap-content'
+    $before = Get-ProfileSnapshot $tree
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'atlas.db'), 'DATABASE')
+    $after = Get-ProfileSnapshot $tree
+    Check ($after -cne $before) 'the record differs'
+    Check ((Get-SnapshotCount $after) -eq (Get-SnapshotCount $before)) 'the number of objects is the same: only the hash tells'
+
+    Start-Case 'E: a change of the size of a file changes the record'
+    $tree = New-ProfileTree 'snap-size'
+    $before = Get-ProfileSnapshot $tree
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'deep') 'nested.txt'), 'nested and longer')
+    Check ((Get-ProfileSnapshot $tree) -cne $before) 'the record differs'
+
+    Start-Case 'E: a file that is added, a file that is removed, a directory that is added: each changes the record'
+    $tree = New-ProfileTree 'snap-add-remove'
+    $before = Get-ProfileSnapshot $tree
+    $added = Join-Path (Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'deep') 'added.txt'
+    [System.IO.File]::WriteAllText($added, '')
+    Check ((Get-ProfileSnapshot $tree) -cne $before) 'an added (even empty) file is noticed'
+    Remove-Item -LiteralPath $added -Force
+    Check ((Get-ProfileSnapshot $tree) -ceq $before) 'without it the record is the first one again'
+    Remove-Item -LiteralPath (Join-Path (Join-Path $tree $AppId) 'storage.initialized') -Force
+    Check ((Get-ProfileSnapshot $tree) -cne $before) 'a removed file is noticed'
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path $tree $AppId) 'storage.initialized'), 'marker')
+    Check ((Get-ProfileSnapshot $tree) -ceq $before) 'put back, the record is the first one again'
+    New-Item -ItemType Directory -Path (Join-Path (Join-Path $tree $AppId) 'new-directory') | Out-Null
+    Check ((Get-ProfileSnapshot $tree) -cne $before) 'an added empty directory is noticed'
+
+    Start-Case 'E: a directory in the place of a file of the same name changes the record'
+    $tree = New-ProfileTree 'snap-type'
+    $before = Get-ProfileSnapshot $tree
+    $marker = Join-Path (Join-Path $tree $AppId) 'storage.initialized'
+    Remove-Item -LiteralPath $marker -Force
+    New-Item -ItemType Directory -Path $marker | Out-Null
+    Check ((Get-ProfileSnapshot $tree) -cne $before) 'the record differs'
+
+    Start-Case 'E: a file that cannot be read (held exclusively) fails the record, it is not passed over'
+    $tree = New-ProfileTree 'snap-locked'
+    $held = Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'atlas.db'
+    $lock = [System.IO.File]::Open($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try { $failure = Get-SnapshotError $tree } finally { $lock.Dispose() }
+    Check ($failure -ne '') 'the record fails'
+    Check ($failure.Contains("$AppId/data/atlas.db")) 'the error names the file'
+    Check ((Get-SnapshotError $tree) -eq '') 'once the file is free the record is taken'
+
+    Start-Case 'E: an error while hashing or listing fails the record'
+    $tree = New-ProfileTree 'snap-faults'
+    $script:SnapshotFailHash = "$AppId/data/deep/nested.txt"
+    try { $failure = Get-SnapshotError $tree } finally { $script:SnapshotFailHash = '' }
+    Check ($failure.Contains('cannot be read') -and $failure.Contains('nested.txt')) 'a file that cannot be hashed fails the record and is named'
+    $script:SnapshotFailList = "$AppId/data/deep"
+    try { $failure = Get-SnapshotError $tree } finally { $script:SnapshotFailList = '' }
+    Check ($failure.Contains('cannot be listed') -and $failure.Contains("$AppId/data/deep")) 'a directory that cannot be listed fails the record and is named'
+    Check ((Get-SnapshotError (Join-Path $Work 'no-such-parent')) -ne '') 'a folder that does not exist fails the record'
+    Check ((Get-SnapshotError $tree) -eq '') 'without the faults the record is taken'
+
+    Start-Case 'E: a junction or symbolic link is recorded and not followed, so a loop does not trap the record'
+    $tree = New-ProfileTree 'snap-link'
+    $link = Join-Path (Join-Path (Join-Path $tree $AppId) 'data') 'loop'
+    $made = $true
+    try {
+        # A link from inside the tree back to its top: a loop for a walk that follows links.
+        if ($OnWindows) { New-Item -ItemType Junction -Path $link -Target (Join-Path $tree $AppId) -ErrorAction Stop | Out-Null }
+        else { New-Item -ItemType SymbolicLink -Path $link -Target (Join-Path $tree $AppId) -ErrorAction Stop | Out-Null }
+    } catch { $made = $false }
+    Check $made 'the link could be made for the test'
+    if ($made) {
+        $record = Get-ProfileSnapshot $tree
+        Check ($record.Contains("l|$AppId/data/loop")) 'the link is recorded as a link'
+        Check (-not $record.Contains("$AppId/data/loop/")) 'nothing behind the link is recorded'
+        Check ((Get-SnapshotCount $record) -eq 10) "the record ends, with ten objects (the nine and the link), got $(Get-SnapshotCount $record)"
+        # Taken down again without following it.
+        if ($OnWindows) { [System.IO.Directory]::Delete($link) } else { Remove-Item -LiteralPath $link -Force }
+    }
+
+    Start-Case 'E: a path beyond 260 characters is recorded or fails the record, it is never left out'
+    $tree = New-ProfileTree 'snap-long'
+    $long = Join-Path $tree $AppId
+    foreach ($n in 1..6) { $long = Join-Path $long ('long-directory-name-' + ('x' * 30) + "-$n") }
+    $deepFile = Join-Path $long 'deep-file.txt'
+    $created = $true
+    try {
+        $prefix = ''
+        if ($OnWindows) { $prefix = '\\?\' }
+        [void][System.IO.Directory]::CreateDirectory($prefix + $long)
+        [System.IO.File]::WriteAllText($prefix + $deepFile, 'deep')
+    } catch { $created = $false }
+    if (-not $created) {
+        Skip-Case 'a path that long could not be created here, so there is nothing to record'
+    } else {
+        Check ($deepFile.Length -gt 260) "the path is longer than 260 characters ($($deepFile.Length))"
+        $record = ''
+        $failure = ''
+        try { $record = Get-ProfileSnapshot $tree } catch { $failure = "$($_.Exception.Message)" }
+        Check (($failure -ne '') -or $record.Contains('deep-file.txt')) 'the deep file is in the record, or the record fails'
+        Write-Host "        (here: $(if ($failure) { 'the record fails' } else { 'the deep file is recorded' }))"
+        try { [System.IO.Directory]::Delete($prefix + (Join-Path (Join-Path $tree $AppId) ('long-directory-name-' + ('x' * 30) + '-1')), $true) } catch { $null = $_ }
+    }
+
+    # ---------------------------------------------------------------------------
+    # Group F: the guard of the suite, end to end (-SelfTest -TestBase)
+    # ---------------------------------------------------------------------------
+
+    # Runs this file as `-SelfTest -TestBase <base>` plus arguments; returns the exit code.
+    function Invoke-Guard([string]$Base, [string[]]$Arguments) {
+        $script:RunNumber++
+        $log = Join-Path $Base ("guard-{0:d2}.txt" -f $script:RunNumber)
+        $all = @('-NoLogo', '-NoProfile')
+        if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
+        $all += @('-File', $Script, '-SelfTest', '-TestBase', $Base) + $Arguments
+        $code = Invoke-Shell $all $log
+        $script:LastLog = $log
+        return $code
+    }
+
+    Start-Case 'F: the guard on an unchanged test profile: exit 0, and it watches the test profile, not the real one'
+    $base = New-Base 'guard-clean'
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Guard $base @()
+    $output = Get-LastOutput
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ($output.Contains("Profile watched: $(Get-Local $base)")) 'the test profile is the one watched'
+    Check ($output -match 'profile guard: the profile is unchanged') 'the guard reports the profile as unchanged'
+    Check ($output -match 'test cases are not run') 'no test case is run in this mode'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the test profile is unchanged'
+
+    foreach ($entry in @(
+            @{ Name = 'the first record cannot be taken'; Fault = 'profile-initial-error'; Code = 2; Pattern = 'The self-test was not started' },
+            @{ Name = 'the second record cannot be taken'; Fault = 'profile-final-error'; Code = 1; Pattern = 'cannot be recorded completely afterwards' },
+            @{ Name = 'the profile changes between the two records'; Fault = 'profile-change'; Code = 1; Pattern = 'the profile changed between the two records' })) {
+        Start-Case "F: $($entry.Name): the child process ends with a non-zero exit code"
+        $base = New-Base ("guard-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $code = Invoke-Guard $base @('-TestFault', $entry.Fault)
+        $output = Get-LastOutput
+        Check ($code -eq $entry.Code) "exit code $($entry.Code), got $code"
+        Check ($code -ne 0) 'the exit code is not zero'
+        Check ($output -match $entry.Pattern) 'the reason is printed'
+        Check ($output -notmatch 'profile guard: the profile is unchanged') 'it does not report the profile as unchanged'
+    }
+
+    Start-Case 'F: a file of the test profile that cannot be read: the suite is not started, exit code 2'
+    $base = New-Base 'guard-locked'
+    $held = Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'
+    $lock = [System.IO.File]::Open($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try { $code = Invoke-Guard $base @() } finally { $lock.Dispose() }
+    $output = Get-LastOutput
+    Check ($code -eq 2) "exit code 2, got $code"
+    Check ($output -match 'cannot be recorded completely') 'the reason is printed'
+    Check ($output.Contains('data/atlas.db')) 'the file is named'
+    $code = Invoke-Guard $base @()
+    Check ($code -eq 0) "once the file is free: exit code 0, got $code"
+
+    foreach ($entry in @(
+            @{ Name = 'ATLAS is running'; Lines = @('100|atlas.exe|C:\x\atlas.exe') },
+            @{ Name = 'a WebView2 process of ATLAS is running'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe') })) {
+        Start-Case "F: $($entry.Name): the self-test is not started and says so"
+        $base = New-Base ("guard-run-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        Set-Processes $base $entry.Lines
+        $code = Invoke-Guard $base @()
+        $output = Get-LastOutput
+        Check ($code -eq 2) "exit code 2, got $code"
+        Check ($output.Contains('Close ATLAS and try again.')) 'it says: Close ATLAS and try again.'
+        Check ($output -notmatch 'Profile watched') 'no record of the profile was attempted'
+        Check ($output -notmatch 'cannot be recorded') 'it is not reported as a failed record'
+    }
+
+    Start-Case 'F: the list of processes cannot be read: the self-test is not started'
+    $base = New-Base 'guard-proc-error'
+    Set-Processes $base @('!error')
+    $code = Invoke-Guard $base @()
+    Check ($code -eq 2) "exit code 2, got $code"
+    Check ((Get-LastOutput) -match 'cannot be checked whether ATLAS is running') 'the reason is printed'
+
+    # ---------------------------------------------------------------------------
+    # Guard rails of the test switches
+    # ---------------------------------------------------------------------------
+
+    # Runs this file with exactly these arguments; returns the exit code.
+    function Invoke-Raw([string]$Name, [string[]]$Arguments) {
+        $log = Join-Path $Work "$Name.txt"
+        $all = @('-NoLogo', '-NoProfile')
+        if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
+        $all += @('-File', $Script) + $Arguments
+        $code = Invoke-Shell $all $log
+        $script:LastLog = $log
+        return $code
+    }
+
+    # The message of an uncaught error is wrapped by the shell: compare without white space.
+    function Get-LastOutputFlat { return ((Get-LastOutput) -replace '\s', '') }
+
+    $base = New-Base 'switches'
+    $switchState = Get-Snapshot $base
+    foreach ($entry in @(
+            @{ Name = '-TestBase without -SelfTest'; Arguments = @('-TestBase', $base); Pattern = 'needs-SelfTest' },
+            @{ Name = '-TestBase -TestRun without -SelfTest'; Arguments = @('-TestBase', $base, '-TestRun'); Pattern = 'needs-SelfTest' },
+            @{ Name = '-TestFault alone'; Arguments = @('-TestFault', 'backup-restore'); Pattern = 'needs-SelfTest-TestBase' },
+            @{ Name = '-TestFault with -SelfTest but without -TestBase'; Arguments = @('-SelfTest', '-TestFault', 'profile-change'); Pattern = 'needs-SelfTest-TestBase' },
+            @{ Name = '-TestFault with -TestBase but without -SelfTest'; Arguments = @('-TestBase', $base, '-TestFault', 'backup-restore'); Pattern = 'needs-SelfTest' },
+            @{ Name = '-TestRun alone'; Arguments = @('-TestRun'); Pattern = 'needs-SelfTest-TestBase' },
+            @{ Name = '-Keep without -SelfTest'; Arguments = @('-Keep'); Pattern = 'onlyfor-SelfTest' },
+            @{ Name = '-Keep with -SelfTest -TestBase'; Arguments = @('-SelfTest', '-TestBase', $base, '-Keep'); Pattern = 'onlyfor-SelfTestwithout-TestBase' },
+            @{ Name = '-SelfTest with -Exe'; Arguments = @('-SelfTest', '-Exe', 'atlas.exe'); Pattern = 'doesnottake-Exe' },
+            @{ Name = '-SelfTest -TestBase with -RestoreOnly and without -TestRun'; Arguments = @('-SelfTest', '-TestBase', $base, '-RestoreOnly'); Pattern = 'doesnottake-Exe' },
+            @{ Name = '-SelfTest -TestBase with a fault of a script run'; Arguments = @('-SelfTest', '-TestBase', $base, '-TestFault', 'backup-restore'); Pattern = 'knowsonlythesefaults' })) {
+        Start-Case "switches: $($entry.Name) is refused before anything is read or changed"
+        $code = Invoke-Raw ("switch-" + [guid]::NewGuid().ToString('N').Substring(0, 8)) $entry.Arguments
+        Check ($code -ne 0) "the script does not run, got $code"
+        Check ((Get-LastOutputFlat) -match $entry.Pattern) 'the reason is named'
+        Check ((Get-LastOutput) -notmatch 'Profile watched|Report directory') 'nothing was started'
+        Check ((Get-Snapshot $base) -eq $switchState) 'the test profile is unchanged'
+    }
+
+    Start-Case 'the profile was not touched and ATLAS was not started by the tests'
+    $profileAfter = $null
+    $failure = ''
+    try { $profileAfter = Get-ProfileSnapshot $ProfileParent } catch { $failure = "$($_.Exception.Message)" }
+    Check ($failure -eq '') "the profile could be recorded completely afterwards ($failure)"
+    Check (($null -ne $profileAfter) -and ($profileAfter -ceq $profileBefore)) "every object named $AppId* is unchanged: type, path, size and SHA-256 ($(Get-SnapshotCount $profileBefore) objects before)"
+    Check (Test-SamePathForTest $ProfileParent ([Environment]::GetFolderPath('LocalApplicationData'))) 'the profile watched by the suite is the real one, not a test profile'
+    $started = @(Get-AtlasProcessIds | Where-Object { $atlasBefore -notcontains $_ })
+    Check ($started.Count -eq 0) "no new ATLAS process appeared (new: $($started -join ', '))"
+    Check (-not (Test-SamePathForTest $Work $ProfileParent)) 'the tests worked in a temporary directory'
+    Check (-not ($Work.TrimEnd('\', '/') + '/').Replace('\', '/').StartsWith((Join-Path $ProfileParent $AppId).Replace('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) 'the temporary directory is not inside the data of ATLAS'
+
+    Stop-Case
+
+    $skipped = @($script:Cases | Where-Object { $_.StartsWith('SKIPPED') }).Count
+    Write-Host ''
+    Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)); cases: $($script:Cases.Count); skipped: $skipped; checks: $($script:Checks); failed checks: $($script:Failures.Count)"
+    if ($Keep) { Write-Host "Kept: $Work" }
+    else { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($script:Failures.Count -gt 0) {
+        $script:Failures | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+        exit 1
+    }
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
