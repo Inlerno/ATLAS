@@ -131,7 +131,8 @@ jobs:
           cargo +1.90.0 build --locked
           cargo +1.90.0 build --locked --features demo-modules
 
-  # The tests of tools/windows/sqlite-foundation-check.ps1 (#28). They need no
+  # The built-in tests of tools/windows/sqlite-foundation-check.ps1 (#28),
+  # run with -SelfTest. They need no
   # Rust, no Node.js and no build: every case runs the script with -TestBase in
   # a temporary directory of its own, so ATLAS is never started and
   # %LOCALAPPDATA% is never read. Run in both shells the script supports.
@@ -166,7 +167,7 @@ jobs:
         run: |
           git log -1 --format='%H %P %s'
           $PSVersionTable | Out-String
-          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.ps1 -SelfTest
           exit $LASTEXITCODE
 
       - name: Tests in PowerShell 7
@@ -175,5 +176,5 @@ jobs:
         run: |
           git log -1 --format='%H %P %s'
           $PSVersionTable | Out-String
-          & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
+          & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.ps1 -SelfTest
           exit $LASTEXITCODE
