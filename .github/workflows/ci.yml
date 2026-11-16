@@ -130,3 +130,44 @@ jobs:
           cargo +1.90.0 --version
           cargo +1.90.0 build --locked
           cargo +1.90.0 build --locked --features demo-modules
+
+  # The tests of tools/windows/sqlite-foundation-check.ps1 (#28). They need no
+  # Rust, no Node.js and no build: every case runs the script with -TestBase in
+  # a temporary directory of its own, so ATLAS is never started and
+  # %LOCALAPPDATA% is never read. Run in both shells the script supports.
+  sqlite-check-script:
+    name: SQLite check script tests (${{ matrix.name }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows PowerShell 5.1
+            shell: powershell
+            exe: powershell.exe
+          - name: PowerShell 7
+            shell: pwsh
+            exe: pwsh.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show environment
+        shell: ${{ matrix.shell }}
+        run: |
+          git log -1 --format='%H %P %s'
+          $PSVersionTable | Out-String
+
+      # A child process with explicit flags, the same way a user starts it. The
+      # test file prints the number of cases, checks and failed checks and ends
+      # with a non-zero exit code when any check failed.
+      - name: sqlite-foundation-check.tests.ps1
+        shell: ${{ matrix.shell }}
+        run: |
+          & ${{ matrix.exe }} -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools\windows\sqlite-foundation-check.tests.ps1
+          exit $LASTEXITCODE
