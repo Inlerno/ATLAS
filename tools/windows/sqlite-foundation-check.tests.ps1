@@ -28,7 +28,9 @@ $Shell = (Get-Process -Id $PID).Path
 $OnWindows = ($PSVersionTable.PSEdition -ne 'Core') -or $IsWindows
 $AppId = 'com.inlerno.atlas'
 $SentinelName = '.atlas-sqlite-check-test-root'
-$Work = Join-Path ([System.IO.Path]::GetTempPath()) ("atlas-sqlite-check-tests-" + [guid]::NewGuid().ToString('N'))
+# Kept short: Windows PowerShell 5.1 cannot go beyond 260 characters, and the
+# backup directories of the script carry a time and a 32 digit run id.
+$Work = Join-Path ([System.IO.Path]::GetTempPath()) ("asct-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $Work | Out-Null
 
 $script:Failures = New-Object System.Collections.ArrayList
@@ -123,9 +125,24 @@ function Invoke-Check([string]$Base, [string[]]$Arguments) {
     $all = @('-NoLogo', '-NoProfile')
     if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
     $all += @('-File', $Script, '-TestBase', $Base) + $Arguments
-    & $Shell @all *> $log
+    $code = Invoke-Shell $all $log
     $script:LastLog = $log
-    return $LASTEXITCODE
+    return $code
+}
+
+# Runs the shell and writes everything it prints to a file, one line of the
+# child per line of the file. Not `*> file`: Windows PowerShell 5.1 would
+# wrap long lines at the width of the console and turn what the child writes
+# to its error stream into terminating errors.
+function Invoke-Shell([string[]]$All, [string]$Log) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $Shell @All 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previous }
+    [System.IO.File]::WriteAllLines($Log, [string[]]$lines)
+    return $code
 }
 $script:RunNumber = 0
 $script:LastLog = ''
@@ -648,6 +665,33 @@ function Get-Instructions([string]$Base) {
     return $text
 }
 
+# The command the instructions give to close run $Id by hand, as written
+# into RESTORE-INSTRUCTIONS.txt, or '' when there is none.
+function Get-ManualCloseCommand([string]$Base, [string]$Id) {
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Base 'home') -Recurse -Filter 'RESTORE-INSTRUCTIONS*.txt' | Sort-Object LastWriteTime -Descending)) {
+        foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+            if ($line.Contains('WriteAllLines(') -and $line.Contains("'$Id'")) { return $line.Trim() }
+        }
+    }
+    return ''
+}
+
+# Runs that command, exactly as a user would paste it.
+function Invoke-ManualClose([string]$Base, [string]$Id) {
+    $command = Get-ManualCloseCommand $Base $Id
+    Check ($command -ne '') 'the instructions give a command that closes the run by hand'
+    Check ($command -notmatch 'New-Item') 'the command does not create an empty file'
+    if ($command -ne '') { Invoke-Expression $command }
+}
+
+function Get-DonePath([string]$Base, [string]$Id) { return (Join-Path (Get-StateDir $Base) "done-$Id.txt") }
+
+function Get-TempMarkers([string]$Base) {
+    $state = Get-StateDir $Base
+    if (-not (Test-Path -LiteralPath $state)) { return @() }
+    return @(Get-ChildItem -LiteralPath $state -Force | Where-Object { $_.Name.StartsWith('tmp-done-') })
+}
+
 function Get-ManifestHashes([string]$Base) {
     return (@(Get-Manifests $Base | Sort-Object Name | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',')
 }
@@ -747,8 +791,16 @@ Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved'
 $code = Invoke-Check $base @()
 Check ($code -eq 3) "a new run refuses with 3, got $code"
 Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the refused run changed nothing'
-# By hand: the user decides that the directory is data and closes the run, as the instructions say.
-New-Item -ItemType File -Path (Join-Path (Get-StateDir $base) "done-$id.txt") | Out-Null
+# An empty "done" file, the old way to close a run, is not accepted any more.
+$empty = Join-Path (Get-StateDir $base) "done-$id.txt"
+New-Item -ItemType File -Path $empty | Out-Null
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 3) "an empty done file does not close the run: exit code 3, got $code"
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was moved and the empty file was not changed'
+Remove-Item -LiteralPath $empty -Force
+# By hand: the user decides that the directory is data and closes the run with the command of the instructions.
+Invoke-ManualClose $base $id
 $code = Invoke-Check $base @('-RestoreOnly')
 Check ($code -eq 0) "-RestoreOnly after the run was closed by hand: exit code 0, got $code"
 Check ((Get-Snapshot (Get-Root $base)) -eq $unknown) 'the directory in the data path was not touched'
@@ -849,6 +901,181 @@ foreach ($entry in @(
 }
 
 # ---------------------------------------------------------------------------
+# Group C: the "done" marker
+# ---------------------------------------------------------------------------
+
+function Get-ValidDoneLines([string]$Id) {
+    return @('format=atlas-sqlite-check-marker-1', 'kind=done', "run_id=$Id", 'written=20261116-093000', "end=$Id")
+}
+
+Start-Case 'C: the marker the script writes is whole, and a finished run stays finished'
+$base = New-Base 'done-own'
+$before = Get-Snapshot (Get-Root $base)
+$code = Invoke-Check $base @()
+Check ($code -eq 0) "exit code 0, got $code"
+$id = @(Get-RunIds $base)[0]
+$done = Get-DonePath $base $id
+Check (Test-Path -LiteralPath $done -PathType Leaf) 'the done marker exists'
+$lines = @([System.IO.File]::ReadAllLines($done))
+Check ($lines.Count -eq 5 -and $lines[0] -ceq 'format=atlas-sqlite-check-marker-1' -and $lines[1] -ceq 'kind=done' -and $lines[2] -ceq "run_id=$id" -and $lines[3] -cmatch '^written=\d{8}-\d{6}$' -and $lines[4] -ceq "end=$id") 'it has exactly the five documented lines'
+Check (@(Get-TempMarkers $base).Count -eq 0) 'no temporary file is left'
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the valid marker was not rewritten and nothing was moved'
+
+$foreign = [guid]::NewGuid().ToString('N')
+foreach ($entry in @(
+        @{ Name = 'empty'; Kind = 'lines'; Lines = @() },
+        @{ Name = 'cut short (three of five lines)'; Kind = 'cut' },
+        @{ Name = 'cut short (the last line is missing)'; Kind = 'cut4' },
+        @{ Name = 'with the run id of another run'; Kind = 'foreign' },
+        @{ Name = 'in the old two-line format'; Kind = 'old' },
+        @{ Name = 'with an extra line'; Kind = 'extra' },
+        @{ Name = 'that only contains the run id somewhere'; Kind = 'substring' },
+        @{ Name = 'that cannot be read (a directory of that name)'; Kind = 'directory' })) {
+    Start-Case "C: a done marker $($entry.Name) does not close the run: exit 3, nothing changed; replaced by hand, then fine"
+    $base = New-Base ("done-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
+    $id = @(Get-RunIds $base)[0]
+    $done = Get-DonePath $base $id
+    $hashes = Get-ManifestHashes $base
+    $valid = Get-ValidDoneLines $id
+    Remove-Item -LiteralPath $done -Force
+    switch ($entry.Kind) {
+        'lines' { [System.IO.File]::WriteAllLines($done, [string[]]@()) }
+        'cut' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..2])) }
+        'cut4' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0..3])) }
+        'foreign' { [System.IO.File]::WriteAllLines($done, [string[]]@(Get-ValidDoneLines $foreign)) }
+        'old' { [System.IO.File]::WriteAllLines($done, [string[]]@("run_id=$id", 'written=20261116-093000')) }
+        'extra' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid + @('more=1'))) }
+        'substring' { [System.IO.File]::WriteAllLines($done, [string[]]@($valid[0], $valid[1], "x run_id=$id y", $valid[3], $valid[4])) }
+        'directory' { New-Item -ItemType Directory -Path $done | Out-Null }
+    }
+    $state = Get-Snapshot (Get-Local $base)
+    $code = Invoke-Check $base @('-RestoreOnly')
+    $output = Get-LastOutput
+    Check ($code -eq 3) "-RestoreOnly: exit code 3, got $code"
+    Check ($output -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+    Check ($output -match 'not a valid "done" marker') 'the invalid marker is reported'
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the marker was not changed and nothing was moved'
+    $instructions = Get-Instructions $base
+    Check ($instructions.Contains($done)) 'the instructions name the exact path of the marker'
+    Check ($instructions.Contains($id)) 'the instructions name the run id'
+    Check ($instructions -match 'repairs nothing and restores nothing') 'the instructions say what the marker does not do'
+    Check ($instructions -match 'do NOT create the marker') 'the instructions say when not to create it'
+    Check ($instructions -notmatch 'New-Item -ItemType File') 'the instructions do not offer an empty file'
+    # A new run and a second -RestoreOnly: the same, still nothing changed.
+    $code = Invoke-Check $base @()
+    Check ($code -eq 3) "a new run refuses with 3, got $code"
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 3) "second -RestoreOnly: exit code 3, got $code"
+    Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'still nothing was changed'
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+    Check ((Get-ManifestHashes $base) -eq $hashes) 'the manifest is unchanged'
+    # By hand, as the instructions say: the invalid file aside, the whole marker in its place.
+    Rename-Item -LiteralPath $done -NewName ("invalid-" + (Split-Path -Leaf $done))
+    Invoke-ManualClose $base $id
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly after the marker was replaced by hand: exit code 0, got $code"
+    $code = Invoke-Check $base @()
+    Check ($code -eq 0) "a normal run works again: exit code 0, got $code"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+}
+
+Start-Case 'C: an invalid done marker while a backup and a test directory wait: nothing is moved; without it the restore goes on'
+$base = New-InterruptedBase 'done-pending'
+$id = @(Get-RunIds $base)[0]
+$done = Get-DonePath $base $id
+[System.IO.File]::WriteAllText($done, '')
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 3) "exit code 3, got $code"
+Check ((Get-LastOutput) -notmatch 'Test directory moved|Original data directory restored') 'neither the test directory nor the backup was moved'
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+Check (@(Get-Backups $base).Count -eq 1 -and (Test-IsTestDir (Get-Root $base))) 'the backup and the test directory are where they were'
+Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
+Check (@(Get-Backups $base).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path (Join-Path (Get-Root $base) 'data') 'atlas.db'))) 'the original is back'
+Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the script wrote the whole marker itself'
+
+Start-Case 'C: the markers cannot be read at all: a refusal'
+$base = New-Base 'done-read-error'
+$code = Invoke-Check $base @()
+Check ($code -eq 0) "setup: a normal run ends with 0, got $code"
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly', '-TestFault', 'done-read-error')
+Check ($code -eq 3) "exit code 3, got $code"
+Check ((Get-LastOutput) -notmatch 'Nothing to restore') 'it does not say "nothing to restore"'
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+Start-Case 'C: a file named like a done marker without a run id is reported, not ignored'
+$base = New-Base 'done-no-id'
+$code = Invoke-Check $base @()
+$stray = Join-Path (Get-StateDir $base) 'done-run id.txt'
+[System.IO.File]::WriteAllText($stray, 'x')
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 3) "exit code 3, got $code"
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+
+Start-Case 'C: a temporary marker file that was left behind does not close the run'
+$base = New-InterruptedBase 'done-temp-left' $false
+$id = @(Get-RunIds $base)[0]
+Remove-Item -LiteralPath (Join-Path (Get-Root $base) $SentinelName) -Force
+$temp = Join-Path (Get-StateDir $base) "tmp-done-$id-$([guid]::NewGuid().ToString('N')).tmp"
+[System.IO.File]::WriteAllLines($temp, [string[]]@(Get-ValidDoneLines $id))
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 3) "exit code 3, got $code"
+Check (-not (Test-Path -LiteralPath (Get-DonePath $base $id))) 'no done marker appeared'
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the temporary file was neither used nor deleted, nothing was moved'
+
+foreach ($entry in @(
+        @{ Name = 'the temporary file cannot be written'; Fault = 'done-temp-write'; Temp = 0 },
+        @{ Name = 'the temporary file is written only in part'; Fault = 'done-temp-partial'; Temp = 1 },
+        @{ Name = 'the rename into place fails'; Fault = 'done-rename'; Temp = 1 })) {
+    Start-Case "C: $($entry.Name): no done marker, exit 3; a later -RestoreOnly closes the run"
+    $base = New-Base ("done-w-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $before = Get-Snapshot (Get-Root $base)
+    $code = Invoke-Check $base @('-TestFault', $entry.Fault)
+    $id = @(Get-RunIds $base)[0]
+    $done = Get-DonePath $base $id
+    Check ($code -eq 3) "exit code 3 (the run is not confirmed as finished), got $code"
+    Check (-not (Test-Path -LiteralPath $done)) 'no done marker exists'
+    Check (@(Get-TempMarkers $base).Count -eq $entry.Temp) "temporary files left: $($entry.Temp) (they are not deleted)"
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is in its place and unchanged'
+    Check ((Get-LastOutput) -match 'could not be marked as finished') 'the reason is named'
+    $temps = @(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ','
+    $code = Invoke-Check $base @('-RestoreOnly')
+    Check ($code -eq 0) "-RestoreOnly: exit code 0, got $code"
+    Check (@([System.IO.File]::ReadAllLines($done)).Count -eq 5) 'the whole done marker is written now'
+    Check ((@(Get-TempMarkers $base | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join ',') -eq $temps) 'the old temporary files are still there, unchanged, and no new one is left'
+    Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+}
+
+Start-Case 'C: a file that takes the final name at the last moment is never overwritten'
+$base = New-Base 'done-final-appears'
+$before = Get-Snapshot (Get-Root $base)
+$code = Invoke-Check $base @('-TestFault', 'done-final-appears')
+$id = @(Get-RunIds $base)[0]
+$done = Get-DonePath $base $id
+Check ($code -eq 3) "exit code 3, got $code"
+Check (([System.IO.File]::ReadAllText($done)) -eq 'not written by this run') 'the file that was there first is unchanged'
+Check (@(Get-TempMarkers $base).Count -eq 1) 'the temporary file stays'
+$state = Get-Snapshot (Get-Local $base)
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 3) "-RestoreOnly: exit code 3 (the file is not a valid marker), got $code"
+Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'nothing was changed'
+Check ((Get-Snapshot (Get-Root $base)) -eq $before) 'the data of the user is unchanged'
+Rename-Item -LiteralPath $done -NewName "invalid-done-$id.txt"
+$code = Invoke-Check $base @('-RestoreOnly')
+Check ($code -eq 0) "after the file was moved aside: exit code 0, got $code"
+
+# ---------------------------------------------------------------------------
 # Guard rails of the test switches
 # ---------------------------------------------------------------------------
 
@@ -857,9 +1084,10 @@ $log = Join-Path $Work 'guard.txt'
 $all = @('-NoLogo', '-NoProfile')
 if ($OnWindows) { $all += @('-ExecutionPolicy', 'Bypass') }
 $all += @('-File', $Script, '-TestFault', 'backup-restore')
-& $Shell @all *> $log
-Check ($LASTEXITCODE -ne 0) 'the script does not run'
-Check (([System.IO.File]::ReadAllText($log)) -match 'needs -TestBase') 'the reason is named'
+$code = Invoke-Shell $all $log
+Check ($code -ne 0) 'the script does not run'
+# The message of an uncaught error is wrapped by the shell: compare without white space.
+Check ((([System.IO.File]::ReadAllText($log)) -replace '\s', '') -match 'needs-TestBase') 'the reason is named'
 
 Stop-Case
 

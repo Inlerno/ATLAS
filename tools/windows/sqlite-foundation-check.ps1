@@ -51,6 +51,25 @@
     moves nothing, ends with exit code 3 and never says "nothing to
     restore".
 
+    A "done" marker counts only when it is whole. Its format is exactly
+    these five lines, nothing before, between or after them:
+
+        format=atlas-sqlite-check-marker-1
+        kind=done
+        run_id=<the 32 hexadecimal digits of the file name done-<id>.txt>
+        written=<yyyyMMdd-HHmmss>
+        end=<the same run id>
+
+    An empty, cut short, unreadable or otherwise different file, or one
+    with another run id, is NOT a "done" marker: the run stays unfinished,
+    the script ends with exit code 3 and names the file. It never repairs,
+    rewrites or deletes such a file; you replace it by hand after you have
+    looked at the directories (RESTORE-INSTRUCTIONS.txt has the command).
+    The script itself writes the marker to a temporary file
+    tmp-done-<id>-<random>.tmp in the same directory, checks it and renames
+    it into place without overwriting. A temporary file that is left behind
+    is never taken for a marker and never deleted by the script.
+
     Do NOT start ATLAS while the script isolates or restores the data
     directory. The check of the processes is an additional safeguard, not a
     guarantee: a process that starts between the check and the file
@@ -400,20 +419,111 @@ function Get-MarkerPath([string]$Kind, [string]$Id) {
     return (Join-Path $StateDir "$Kind-$Id.txt")
 }
 
+# The "touched" marker. Any file of that name means "touched": a remnant can
+# only make the script more careful.
 function Write-Marker([string]$Kind, [string]$Id) {
+    if ($Kind -ne 'touched') { throw "Write-Marker writes only 'touched' markers; 'done' goes through Write-DoneMarker." }
     $path = Get-MarkerPath $Kind $Id
     if (Test-Path -LiteralPath $path) { return }
     Write-NewFile $path @("run_id=$Id", "written=$(Get-Date -Format 'yyyyMMdd-HHmmss')")
 }
 
-# The ids of the runs that touched the data path and were not finished.
-# Throws when the directory of the manifests cannot be listed.
+# The five lines of a "done" marker (see the description at the top).
+$DoneFormatLine = 'format=atlas-sqlite-check-marker-1'
+function Get-DoneLines([string]$Id) {
+    return @($DoneFormatLine, 'kind=done', "run_id=$Id", "written=$(Get-Date -Format 'yyyyMMdd-HHmmss')", "end=$Id")
+}
+
+# Why the file at $Path is not a whole "done" marker of run $Id, or '' when
+# it is one. Every line is compared as a whole and case-sensitively.
+function Get-DoneDefect([string]$Path, [string]$Id) {
+    $lines = $null
+    try {
+        if ($TestBase -and ($Faults -contains 'done-read-error')) { throw 'injected test fault: the marker cannot be read' }
+        $lines = [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
+    } catch { return "it cannot be read ($($_.Exception.Message))" }
+    $lines = @($lines)
+    if ($lines.Count -eq 0) { return 'it is empty' }
+    if ($lines.Count -ne 5) { return "it has $($lines.Count) line(s) instead of 5 (cut short or changed)" }
+    if ($lines[0] -cne $DoneFormatLine) { return 'its first line is not the format line' }
+    if ($lines[1] -cne 'kind=done') { return 'its second line is not "kind=done"' }
+    if ($lines[2] -cnotmatch '^run_id=[0-9a-f]{32}$') { return 'it has no valid run_id line' }
+    if ($lines[2] -cne "run_id=$Id") { return "its run_id is not the run id in the file name ($Id)" }
+    if ($lines[3] -cnotmatch '^written=\d{8}-\d{6}$') { return 'its "written" line is not valid' }
+    if ($lines[4] -cne "end=$Id") { return 'its last line is not the "end" line of this run (cut short or changed)' }
+    return ''
+}
+
+# The "done" marker of a run: absent, valid or invalid (with the reason).
+function Get-DoneState([string]$Id) {
+    $path = Get-MarkerPath 'done' $Id
+    if (-not (Test-Path -LiteralPath $path)) { return [pscustomobject]@{ State = 'absent'; Id = $Id; Path = $path; Reason = '' } }
+    $defect = Get-DoneDefect $path $Id
+    if ($defect) { return [pscustomobject]@{ State = 'invalid'; Id = $Id; Path = $path; Reason = $defect } }
+    return [pscustomobject]@{ State = 'valid'; Id = $Id; Path = $path; Reason = '' }
+}
+
+# Every entry named done-*.txt that is not a whole "done" marker. Throws when
+# the directory of the manifests cannot be listed.
+function Get-InvalidDoneMarkers {
+    if (-not (Test-Path -LiteralPath $StateDir)) { return @() }
+    $bad = @()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $StateDir -Force -ErrorAction Stop)) {
+        if ($entry.Name -notmatch '^done-.*\.txt$') { continue }
+        if ($entry.Name -notmatch '^done-([0-9a-f]{32})\.txt$') {
+            $bad += [pscustomobject]@{ State = 'invalid'; Id = ''; Path = $entry.FullName; Reason = 'its name carries no run id' }
+            continue
+        }
+        $state = Get-DoneState $Matches[1]
+        if ($state.State -eq 'invalid') { $bad += $state }
+    }
+    return $bad
+}
+
+# Writes the "done" marker of a run: a temporary file in the same directory,
+# flushed to the disk, read back and checked, then renamed into place.
+# File.Move never overwrites, in .NET Framework (Windows PowerShell 5.1) and
+# in .NET (PowerShell 7) alike. Nothing is deleted on failure: a temporary
+# file that stays is not a marker. Throws unless a valid marker is in place
+# afterwards.
+function Write-DoneMarker([string]$Id) {
+    $existing = Get-DoneState $Id
+    if ($existing.State -eq 'valid') { return }
+    if ($existing.State -eq 'invalid') {
+        throw "the marker $($existing.Path) exists and is not a valid `"done`" marker ($($existing.Reason)); it was not overwritten"
+    }
+    $final = $existing.Path
+    $temp = Join-Path $StateDir "tmp-done-$Id-$([guid]::NewGuid().ToString('N')).tmp"
+    Invoke-Fault 'done-temp-write'
+    $stream = [System.IO.File]::Open($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+        $lines = @(Get-DoneLines $Id)
+        if ($TestBase -and ($Faults -contains 'done-temp-partial')) { $lines = @($lines[0..1]) }
+        foreach ($line in $lines) { $writer.WriteLine($line) }
+        $writer.Flush()
+        # Through the cache of the operating system to the disk.
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+    $defect = Get-DoneDefect $temp $Id
+    if ($defect) { throw "the temporary marker $temp does not read back ($defect); the run is not marked as finished" }
+    Invoke-Fault 'done-rename'
+    # Only for the tests: another file takes the final name at the last moment.
+    if ($TestBase -and ($Faults -contains 'done-final-appears')) { [System.IO.File]::WriteAllText($final, 'not written by this run') }
+    [System.IO.File]::Move($temp, $final)
+    $after = Get-DoneState $Id
+    if ($after.State -ne 'valid') { throw "the marker $final is not valid after the rename ($($after.Reason))" }
+}
+
+# The ids of the runs that touched the data path and have no valid "done"
+# marker. Throws when the directory of the manifests cannot be listed.
 function Get-TouchedRuns {
     if (-not (Test-Path -LiteralPath $StateDir)) { return @() }
     $ids = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $StateDir -File -Filter 'touched-*.txt' -ErrorAction Stop)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $StateDir -Force -ErrorAction Stop)) {
         if ($file.Name -match '^touched-([0-9a-f]{32})\.txt$') {
-            if (-not (Test-Path -LiteralPath (Get-MarkerPath 'done' $Matches[1]))) { $ids += $Matches[1] }
+            $id = $Matches[1]
+            if ((Get-DoneState $id).State -ne 'valid') { $ids += $id }
         }
     }
     return $ids
@@ -473,10 +583,19 @@ function Get-RunState([string]$Id) {
 # get their "done" marker. Throws when the markers cannot be listed.
 function Get-RunProblems([switch]$Close) {
     $problems = @()
+    # A file that claims to be a "done" marker and is not one is a problem of
+    # its own: it is reported, never repaired, and its run is not closed.
+    $badIds = @()
+    foreach ($bad in @(Get-InvalidDoneMarkers)) {
+        $whose = 'of no known run'
+        if ($bad.Id) { $whose = "of run $($bad.Id)"; $badIds += $bad.Id }
+        $problems += [pscustomobject]@{ State = 'problem'; Id = $bad.Id; Text = "the file $($bad.Path) $whose is not a valid `"done`" marker: $($bad.Reason). It was not changed, and the run is not taken as finished" }
+    }
     foreach ($id in @(Get-TouchedRuns)) {
+        if ($badIds -contains $id) { continue }
         $state = Get-RunState $id
         if ($state.State -eq 'problem') { $problems += $state }
-        elseif ($state.State -eq 'settled' -and $Close) { Write-Marker 'done' $id }
+        elseif ($state.State -eq 'settled' -and $Close) { Write-DoneMarker $id }
     }
     return $problems
 }
@@ -612,10 +731,36 @@ function Write-RestoreInstructions([string]$Why) {
             $runLines += 'automatically: it may be your data. Look into it yourself:'
             $runLines += '  - it is leftovers of the test (a fresh atlas.db, logs of the test run):'
             $runLines += "    move it away by hand, then run the script with -RestoreOnly;"
-            $runLines += '  - it is your data and nothing else has to come back: tell the script that'
-            $runLines += '    the run is finished by creating its "done" marker, for example'
-            $runLines += "        New-Item -ItemType File -Path '$(Join-Path $StateDir 'done-<run id>.txt')'"
-            $runLines += '    and run the script with -RestoreOnly to check.'
+            $runLines += '  - it is your data, you have checked that, and nothing else has to come'
+            $runLines += '    back: close the run by hand with its "done" marker (see below) and run'
+            $runLines += '    the script with -RestoreOnly to check;'
+            $runLines += '  - you cannot tell what the directory is: do NOT create the marker. Keep'
+            $runLines += '    everything as it is and compare the directory with the backup first.'
+            $runLines += ''
+            $runLines += 'Closing a run by hand. The "done" marker only tells the script that this one'
+            $runLines += 'run is finished. It repairs nothing and restores nothing. Create it only'
+            $runLines += "after you have looked at '$Root' and at the backups and know that your data"
+            $runLines += 'is where it belongs. The command writes exactly what the script checks:'
+            foreach ($id in $open) {
+                $target = Get-MarkerPath 'done' $id
+                $runLines += "  run $id"
+                $runLines += ('    $id = ' + "'$id'" + '; [System.IO.File]::WriteAllLines(' + "'$target'" + ', [string[]]@(' + "'$DoneFormatLine'" + ", 'kind=done', " + '"run_id=$id", (' + "'written='" + " + (Get-Date -Format 'yyyyMMdd-HHmmss')), " + '"end=$id"))')
+            }
+        }
+        $invalid = @(Get-InvalidDoneMarkers)
+        if ($invalid.Count -gt 0) {
+            $runLines += ''
+            $runLines += 'Files that are named like a "done" marker and are NOT valid markers. The'
+            $runLines += 'script did not change them and will not: it stops with exit code 3 until'
+            $runLines += 'you have dealt with them.'
+            foreach ($bad in $invalid) {
+                $runLines += "  $($bad.Path)"
+                if ($bad.Id) { $runLines += "    run id: $($bad.Id)" }
+                $runLines += "    reason: $($bad.Reason)"
+                $runLines += "    Check the directories first. Then move the file aside, for example"
+                $runLines += "        Rename-Item -LiteralPath '$($bad.Path)' -NewName 'invalid-$(Split-Path -Leaf $bad.Path)'"
+                if ($bad.Id) { $runLines += '    and, if the run really is finished, write the marker with the command above.' }
+            }
         }
     } catch {
         $runLines += ''
@@ -1002,6 +1147,17 @@ function Invoke-RestoreOnly {
         $script:OriginalInPlace = $false
         $script:OriginalWhere = "not known: $LocalAppData could not be listed"
         Write-RestoreInstructions "$LocalAppData cannot be listed ($($_.Exception.Message)), so it is not known whether a backup exists. Nothing was moved."
+        return 3
+    }
+    # A file that is named like a "done" marker and is not one stops the
+    # restore before anything is moved, whatever else is on the disk.
+    $invalidDone = @(Get-InvalidDoneMarkers)
+    if ($invalidDone.Count -gt 0) {
+        $script:OriginalInPlace = $false
+        $script:OriginalWhere = 'not confirmed'
+        if ($backups.Count -ge 1) { $script:OriginalWhere = (@($backups | ForEach-Object { $_.FullName }) -join '; ') }
+        $what = @($invalidDone | ForEach-Object { 'the file ' + $_.Path + ' is not a valid "done" marker (' + $_.Reason + ')' }) -join '; '
+        Write-RestoreInstructions "$what. Nothing was moved and the file was not changed."
         return 3
     }
     $rootExists = Test-Path -LiteralPath $Root
@@ -1665,10 +1821,11 @@ try {
         $restored = Exit-Isolation
         # The run is finished only when the data path is settled again.
         if ($restored -and $script:OriginalInPlace -and $script:Touched) {
-            try { Write-Marker 'done' $RunId }
+            try { Write-DoneMarker $RunId }
             catch {
                 $restored = $false
-                Write-RestoreInstructions "the data path is settled, but the marker $(Get-MarkerPath 'done' $RunId) could not be written ($($_.Exception.Message)). Run the script with -RestoreOnly: it checks the state again and writes the marker."
+                $script:ManualSteps = 'run the script with -RestoreOnly'
+                Write-RestoreInstructions "the data path is settled, but the run could not be marked as finished: $($_.Exception.Message). Run the script with -RestoreOnly: it checks the state again and writes the marker."
             }
         }
     } else {
