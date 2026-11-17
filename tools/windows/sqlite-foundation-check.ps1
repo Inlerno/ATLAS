@@ -143,7 +143,9 @@
     by object: the type and the relative path of each, and the size and
     the SHA-256 of every file; junctions and symbolic links are recorded
     and not followed. If ATLAS is running the tests are not started: close
-    ATLAS and try again. If the record cannot be taken completely (a file
+    ATLAS and try again. They are not started either while a WebView2
+    process runs whose command line cannot be read: it may belong to ATLAS,
+    and the script does not assume that it does not. No process is ended. If the record cannot be taken completely (a file
     cannot be read, a directory cannot be listed, a path is too long for
     Windows PowerShell 5.1) the tests fail instead of passing over it.
     Exit codes: 0 every check passed; 1 a check failed; 2 the tests were
@@ -1822,11 +1824,15 @@ if ($SuiteMode -or $GuardMode) {
     }
 
     # ATLAS must not be running: its files are held and change, and a failed
-    # record must not be the way this is found out.
+    # record must not be the way this is found out. A WebView2 process whose
+    # command line cannot be read may be one of ATLAS: not knowing is not
+    # "not running". No process is ended here; the self-test only stops.
     $alive = $null
+    $unknown = $null
     try {
         $blocking = Get-Blocking
         $alive = @($blocking.App) + @($blocking.WebView)
+        $unknown = @($blocking.Unknown)
     } catch {
         Write-Host "It cannot be checked whether ATLAS is running: $($_.Exception.Message)"
         Write-Host 'The self-test was not started.'
@@ -1835,6 +1841,13 @@ if ($SuiteMode -or $GuardMode) {
     if ($alive.Count -gt 0) {
         Write-Host "ATLAS is running: $(Format-Processes $alive)."
         Write-Host 'Close ATLAS and try again.'
+        Write-Host 'The self-test was not started.'
+        exit 2
+    }
+    if ($unknown.Count -gt 0) {
+        Write-Host "It cannot be told whose these WebView2 processes are: $(Format-Processes $unknown)."
+        Write-Host 'Their command line cannot be read, so they may belong to ATLAS, and the self-test stops rather than assume they do not.'
+        Write-Host 'Close the applications they belong to (or sign out other users) and try again. The script does not end them.'
         Write-Host 'The self-test was not started.'
         exit 2
     }
@@ -3345,26 +3358,47 @@ if ($SuiteMode -or $GuardMode) {
     $code = Invoke-Guard $base @()
     Check ($code -eq 0) "once the file is free: exit code 0, got $code"
 
+    # The process list of these cases is a file of the test profile; no real
+    # process is started, looked at or ended. Each refusal is also run with a
+    # fault that would fail the first record: if the record were attempted, the
+    # output would say so.
     foreach ($entry in @(
-            @{ Name = 'ATLAS is running'; Lines = @('100|atlas.exe|C:\x\atlas.exe') },
-            @{ Name = 'a WebView2 process of ATLAS is running'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe') })) {
-        Start-Case "F: $($entry.Name): the self-test is not started and says so"
+            @{ Name = 'ATLAS is running'; Lines = @('100|atlas.exe|C:\x\atlas.exe'); Pattern = 'ATLAS is running: atlas\.exe \(id 100\)'; Close = $true },
+            @{ Name = 'a WebView2 process of ATLAS is running'; Lines = @('200|msedgewebview2.exe|msedgewebview2.exe --type=renderer --webview-exe-name=atlas.exe'); Pattern = 'ATLAS is running: msedgewebview2\.exe \(id 200\)'; Close = $true },
+            @{ Name = 'a WebView2 process of unknown owner is running'; Lines = @('300|msedgewebview2.exe|<unreadable>'); Pattern = 'cannot be told whose these WebView2 processes are: msedgewebview2\.exe \(id 300\)'; Close = $false },
+            @{ Name = 'a WebView2 process of unknown owner is running next to one of another application'; Lines = @('400|msedgewebview2.exe|msedgewebview2.exe --webview-exe-name=Teams.exe', '301|msedgewebview2.exe|<unreadable>'); Pattern = 'cannot be told whose these WebView2 processes are: msedgewebview2\.exe \(id 301\)'; Close = $false },
+            @{ Name = 'the list of processes cannot be read'; Lines = @('!error'); Pattern = 'cannot be checked whether ATLAS is running'; Close = $false })) {
+        Start-Case "F: $($entry.Name): the self-test stops with exit code 2 before the first record and before any test case"
         $base = New-Base ("guard-run-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
         Set-Processes $base $entry.Lines
-        $code = Invoke-Guard $base @()
-        $output = Get-LastOutput
-        Check ($code -eq 2) "exit code 2, got $code"
-        Check ($output.Contains('Close ATLAS and try again.')) 'it says: Close ATLAS and try again.'
-        Check ($output -notmatch 'Profile watched') 'no record of the profile was attempted'
-        Check ($output -notmatch 'cannot be recorded') 'it is not reported as a failed record'
+        $state = Get-Snapshot (Get-Local $base)
+        foreach ($arguments in @(@(), @('-TestFault', 'profile-initial-error'))) {
+            $code = Invoke-Guard $base $arguments
+            $output = Get-LastOutput
+            Check ($code -eq 2) "exit code 2, got $code (arguments: $($arguments -join ' '))"
+            Check ($output -match $entry.Pattern) 'the reason is printed, with the process'
+            Check ($output.Contains('The self-test was not started.')) 'it says that the self-test was not started'
+            Check ($output.Contains('Close ATLAS and try again.') -eq $entry.Close) 'it says "Close ATLAS and try again." exactly when ATLAS is what runs'
+            Check ($output -notmatch 'Profile watched') 'the first record of the profile was not taken'
+            Check ($output -notmatch 'cannot be recorded') 'the record was not even attempted (the fault that fails it did not fire)'
+            Check ($output -notmatch 'profile guard:|cases:|^ok ') 'no guard check and no test case was run'
+        }
+        if ($entry.Name -match 'unknown owner') {
+            Check ((Get-LastOutput) -match 'may belong to ATLAS') 'it explains that the owner cannot be determined and that this is why it stops'
+            Check ((Get-LastOutput) -match 'does not end them') 'it says that no process is ended'
+        }
+        Check ((Get-Snapshot (Get-Local $base)) -eq $state) 'the test profile is unchanged'
     }
 
-    Start-Case 'F: the list of processes cannot be read: the self-test is not started'
-    $base = New-Base 'guard-proc-error'
-    Set-Processes $base @('!error')
+    Start-Case 'F: WebView2 of another application and unrelated processes do not stop the self-test'
+    $base = New-Base 'guard-foreign'
+    Set-Processes $base @(
+        '400|msedgewebview2.exe|msedgewebview2.exe --webview-exe-name=Teams.exe --user-data-dir="C:\Users\u\AppData\Local\Teams\EBWebView"',
+        '401|explorer.exe|C:\Windows\explorer.exe',
+        '402|atlas-helper.exe|C:\other\atlas-helper.exe')
     $code = Invoke-Guard $base @()
-    Check ($code -eq 2) "exit code 2, got $code"
-    Check ((Get-LastOutput) -match 'cannot be checked whether ATLAS is running') 'the reason is printed'
+    Check ($code -eq 0) "exit code 0, got $code"
+    Check ((Get-LastOutput) -match 'Profile watched') 'the record was taken'
 
     # ---------------------------------------------------------------------------
     # Guard rails of the test switches
