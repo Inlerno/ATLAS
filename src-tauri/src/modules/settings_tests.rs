@@ -15,8 +15,8 @@ use tokio::time::Instant;
 use super::config::{MAX_SETTINGS_BYTES, MAX_SETTINGS_DEPTH, ModuleConfig, SettingsProblem};
 use super::contract::{ModuleError, ModuleState, ModuleStatus};
 use super::manager::{
-    ApplyOutcome, INITIALIZE_TIMEOUT, ManagerError, SHUTDOWN_TIMEOUT, STOP_TIMEOUT, StopReport,
-    TASKS_STOP_TIMEOUT, text,
+    ApplyOutcome, INITIALIZE_TIMEOUT, ManagerError, ReplaceOutcome, SHUTDOWN_TIMEOUT, STOP_TIMEOUT,
+    StopReport, TASKS_STOP_TIMEOUT, text,
 };
 use super::plan::ChangeAction;
 use super::testing::*;
@@ -1849,4 +1849,305 @@ fn snapshot_and_settings_debug_hide_values() {
         };
         assert!(!format!("{config:?}").contains("PRIVATE-DEBUG"));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Replacing a damaged configuration (#21, plan of MM-5, 3.9; tests 22–28)
+// ---------------------------------------------------------------------------
+
+/// A store where `t.a` is damaged: the manager starts with it
+/// `ConfigUnavailable`; `t.b` depends on it and is enabled, so it is blocked.
+async fn with_damaged_a(store: &TestStore) -> Harness {
+    store.damage("t.a");
+    store.put("t.b", true, json!({}));
+    let mut h = started(&[("t.a", &[]), ("t.b", &["t.a"])], &[], store).await;
+    h.events();
+    assert!(is_unavailable(&h.status("t.a")));
+    assert_eq!(
+        kind(&h.status("t.b").state),
+        "Blocked(t.a, DependencyConfigUnavailable)"
+    );
+    h
+}
+
+async fn replace(
+    h: &Harness,
+    settings: Value,
+    confirmed: bool,
+) -> Result<ReplaceOutcome, ManagerError> {
+    h.manager
+        .replace_config(id("t.a"), settings, confirmed)
+        .await
+}
+
+/// 22. Nothing without an explicit confirmation.
+#[test]
+fn a_replacement_needs_a_confirmation() {
+    run(async {
+        let store = TestStore::default();
+        let mut h = with_damaged_a(&store).await;
+        assert_eq!(
+            replace(&h, json!({}), false).await,
+            Ok(ReplaceOutcome::ConfirmationRequired)
+        );
+        assert!(is_unavailable(&h.status("t.a")));
+        assert!(store.replacements().is_empty());
+        assert!(h.events().is_empty());
+    });
+}
+
+/// 23. Only for a `ConfigUnavailable` module: the settings of any other one
+///     are changed by `update_settings`.
+#[test]
+fn only_a_config_unavailable_module_is_replaced() {
+    run(async {
+        let store = TestStore::default();
+        store.put("t.run", true, json!({"keep": 1}));
+        let mut h = started(&[("t.off", &[]), ("t.run", &[])], &[], &store).await;
+        h.events();
+        for module in ["t.off", "t.run"] {
+            assert_eq!(
+                h.manager.replace_config(id(module), json!({}), true).await,
+                Err(ManagerError::ConfigAvailable(id(module))),
+                "{module}"
+            );
+        }
+        assert_eq!(
+            h.manager.replace_config(id("t.zz"), json!({}), true).await,
+            Err(ModuleError::UnknownModule(id("t.zz")).into())
+        );
+        assert!(store.replacements().is_empty());
+        assert_eq!(store.record("t.run"), record(true, json!({"keep": 1})));
+        assert!(h.events().is_empty());
+    });
+}
+
+/// 24. The settings are checked before anything is written.
+#[test]
+fn replacement_settings_are_checked_before_the_write() {
+    run(async {
+        let store = TestStore::default();
+        let mut h = with_damaged_a(&store).await;
+        let refused = replace(&h, json!({"invalid": true}), true).await;
+        assert!(
+            matches!(&refused, Err(ManagerError::Module(ModuleError::InvalidSettings { reason, .. })) if reason == FAKE_INVALID),
+            "{refused:?}"
+        );
+        // The common checks too: not an object.
+        assert!(matches!(
+            replace(&h, json!([1]), true).await,
+            Err(ManagerError::Module(ModuleError::InvalidSettings { .. }))
+        ));
+        assert!(store.replacements().is_empty());
+        assert!(is_unavailable(&h.status("t.a")));
+        assert!(h.events().is_empty());
+    });
+}
+
+/// 25. A failed replacement changes nothing.
+#[test]
+fn a_failed_replacement_changes_nothing() {
+    let logs = capture_logs(|| {
+        run(async {
+            let store = TestStore::default();
+            let mut h = with_damaged_a(&store).await;
+            store.fail_saves(true);
+            assert_eq!(replace(&h, json!({}), true).await, Err(ManagerError::Store));
+            assert_eq!(store.replacements(), ["t.a"]);
+            assert!(is_unavailable(&h.status("t.a")));
+            assert_eq!(
+                h.manager.get_settings(&id("t.a")),
+                Err(ManagerError::ConfigUnavailable(id("t.a")))
+            );
+            assert!(h.events().is_empty());
+            // The record is still the damaged one.
+            store.fail_saves(false);
+            assert_eq!(
+                replace(&h, json!({}), true).await,
+                Ok(ReplaceOutcome::Replaced)
+            );
+        });
+    });
+    let line = log_line(&logs, "module configuration not replaced: nothing changed");
+    assert!(
+        line.contains("ERROR") && line.contains("module=t.a"),
+        "{line}"
+    );
+    // The details of the store go to the log (and only there), as for `save`.
+    assert!(line.contains("error=fake write error"), "{line}");
+}
+
+/// 26. A confirmed replacement leaves the module disabled and stopped: one
+///     update of the snapshot, then `SettingsChanged`, then `StatusChanged`.
+#[test]
+fn a_confirmed_replacement_leaves_the_module_disabled() {
+    run(async {
+        let store = TestStore::default();
+        let mut h = with_damaged_a(&store).await;
+        let before = h.status("t.a");
+        assert_eq!(
+            replace(&h, json!({"fresh": 1}), true).await,
+            Ok(ReplaceOutcome::Replaced)
+        );
+        assert_eq!(store.record("t.a"), record(false, json!({"fresh": 1})));
+        assert_eq!(h.status("t.a").enabled, Some(false));
+        assert_eq!(h.status("t.a").state, ModuleState::Stopped);
+        let settings = h.manager.get_settings(&id("t.a")).expect("settings");
+        assert_eq!(*settings.value, json!({"fresh": 1}));
+        assert!(settings.valid && !settings.restart_required);
+        assert_eq!(count(&h.probe("t.a").created), 0, "nothing is started");
+
+        let events = h.events();
+        assert_eq!(
+            events,
+            [
+                ModuleEvent::SettingsChanged {
+                    id: id("t.a"),
+                    restart_required: false,
+                },
+                ModuleEvent::StatusChanged {
+                    id: id("t.a"),
+                    previous: before,
+                    current: h.status("t.a"),
+                },
+            ]
+        );
+        // The module is now like any other: a second replacement is refused.
+        assert_eq!(
+            replace(&h, json!({}), true).await,
+            Err(ManagerError::ConfigAvailable(id("t.a")))
+        );
+    });
+}
+
+/// 27. Dependents stay blocked; a confirmed `recover` brings them up, with
+///     the replaced dependency.
+#[test]
+fn recover_after_replacement_brings_up_the_disabled_dependency() {
+    run(async {
+        let store = TestStore::default();
+        let mut h = with_damaged_a(&store).await;
+        replace(&h, json!({}), true).await.expect("replaced");
+        h.events();
+        assert_eq!(
+            kind(&h.status("t.b").state),
+            "Blocked(t.a, DependencyConfigUnavailable)",
+            "the reason is not recomputed by the replacement"
+        );
+        h.confirm(ChangeAction::Recover, "t.b").await;
+        for module in ["t.a", "t.b"] {
+            assert_eq!(h.status(module).enabled, Some(true), "{module}");
+            assert_eq!(h.status(module).state, ModuleState::Running, "{module}");
+        }
+        assert_eq!(store.record("t.a"), record(true, json!({})));
+    });
+}
+
+/// 28. The next run reads the replaced record.
+#[test]
+fn the_next_run_reads_the_replaced_record() {
+    run(async {
+        let store = TestStore::default();
+        let first = with_damaged_a(&store).await;
+        replace(&first, json!({"fresh": 1}), true)
+            .await
+            .expect("replaced");
+        first.manager.shutdown().await.expect("exit");
+
+        let next = started(&[("t.a", &[]), ("t.b", &["t.a"])], &[], &store).await;
+        assert_eq!(next.status("t.a").enabled, Some(false));
+        assert_eq!(next.status("t.a").state, ModuleState::Stopped);
+        assert_eq!(settings_of(&next, "t.a"), json!({"fresh": 1}));
+        assert_eq!(
+            kind(&next.status("t.b").state),
+            "Blocked(t.a, DependencyDisabled)"
+        );
+    });
+}
+
+/// O-10a, O-10c: a module that is `ConfigUnavailable` because the store
+/// could not be read is not replaced when its record turns out readable or
+/// absent on the second look. Nothing changes; the next start reads it again.
+#[test]
+fn a_readable_or_missing_record_is_not_replaced() {
+    let logs = capture_logs(|| {
+        run(async {
+            let store = TestStore::default();
+            store.put("t.a", true, json!({"keep": 1}));
+            store.fail_load("t.a");
+            store.fail_load("t.b");
+            let mut h = started(&[("t.a", &[]), ("t.b", &[])], &[], &store).await;
+            h.events();
+            for module in ["t.a", "t.b"] {
+                assert!(is_unavailable(&h.status(module)), "{module}");
+                assert_eq!(
+                    h.manager.replace_config(id(module), json!({}), true).await,
+                    Err(ManagerError::ConfigAvailable(id(module))),
+                    "{module}"
+                );
+                assert!(is_unavailable(&h.status(module)), "{module}");
+            }
+            assert_eq!(store.replacements(), ["t.a", "t.b"]);
+            assert_eq!(store.record("t.a"), record(true, json!({"keep": 1})));
+            assert_eq!(store.record("t.b"), None);
+            assert!(h.events().is_empty());
+        });
+    });
+    assert_eq!(
+        logs.matches("module configuration not replaced: the stored record is readable or absent")
+            .count(),
+        2
+    );
+}
+
+/// Exit rules: after the exit request the command is refused.
+#[test]
+fn a_replacement_after_the_exit_request_is_refused() {
+    run(async {
+        let store = TestStore::default();
+        let h = with_damaged_a(&store).await;
+        h.manager.shutdown().await.expect("exit");
+        assert_eq!(
+            replace(&h, json!({}), true).await,
+            Err(ManagerError::ShutDown)
+        );
+        assert!(store.replacements().is_empty());
+    });
+}
+
+/// A replacement still waiting at the exit deadline is given up: an error,
+/// nothing changes in memory, and the log says that the stored outcome is
+/// known only at the next start.
+#[test]
+fn a_replacement_cut_by_the_exit_deadline_changes_nothing_in_memory() {
+    let logs = capture_logs(|| {
+        run(async {
+            let store = TestStore::default();
+            let mut h = with_damaged_a(&store).await;
+            store.hang_saves(true);
+            let m = h.manager.clone();
+            let replacing =
+                tokio::spawn(async move { m.replace_config(id("t.a"), json!({}), true).await });
+            let watched = store.clone();
+            wait_until_with_pool(move || watched.replacements().len() == 1).await;
+            let begun = Instant::now();
+            h.manager.shutdown().await.expect("exit");
+            assert_eq!(begun.elapsed(), SHUTDOWN_TIMEOUT);
+            assert_eq!(replacing.await.expect("task"), Err(ManagerError::Store));
+            assert!(is_unavailable(&h.status("t.a")));
+            assert!(
+                !h.events()
+                    .iter()
+                    .any(|event| matches!(event, ModuleEvent::SettingsChanged { .. })),
+            );
+        });
+    });
+    let line = log_line(
+        &logs,
+        "module configuration replacement not confirmed before the exit deadline",
+    );
+    assert!(
+        line.contains("stored outcome unknown until the next start"),
+        "{line}"
+    );
 }

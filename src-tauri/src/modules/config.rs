@@ -4,16 +4,19 @@
 //!
 //! The lifecycle manager owns the configuration: it reads the store once, at
 //! startup, and afterwards only writes to it, always one atomic batch per
-//! command. The store here keeps everything in memory; persistence between
-//! application runs (SQLite) arrives with MM-5B.
+//! command. The application keeps it in SQLite between runs
+//! ([`super::config_sqlite`], MM-5B); the store here keeps everything in
+//! memory, for tests.
 //!
 //! Settings values never reach the log, events or `Debug` output: they may
 //! hold user data. Secrets do not belong in settings at all — only a reference
 //! to the operating system's secure storage (e.g. `token_ref`).
 
-use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+#[cfg(test)]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
@@ -69,60 +72,121 @@ impl fmt::Debug for ModuleConfig {
 #[error("{0}")]
 pub struct StoreError(pub String);
 
+/// What [`ModuleConfigStore::replace_if_damaged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceResult {
+    /// The stored record was damaged and has been replaced.
+    Replaced,
+    /// The stored record is usable, or there is none: nothing was written.
+    NotDamaged,
+}
+
 /// Where module configuration is kept.
 ///
-/// Asynchronous, because the real store (SQLite, MM-5B) does I/O. The manager
-/// reads every module once at startup and writes only whole batches.
+/// Asynchronous, because the real store (SQLite) does I/O. The manager reads
+/// every module once at startup and writes only whole batches.
+///
+/// A record is **damaged** when it exists but cannot be read as a
+/// configuration: the reason [`load`](Self::load) fails because of the
+/// content. Settings that are read but refused by the checks of the module
+/// are not damage: `load` returns them and the manager marks them invalid.
+/// An error of the store itself — it cannot be reached, it is busy, read-only
+/// or closed — is never taken for damage.
 pub trait ModuleConfigStore: Send + Sync {
-    /// The record of `id`, or `None` if there is none yet.
+    /// The record of `id`, or `None` if there is none yet. `Err` if the
+    /// record is damaged or the store cannot be read.
     fn load<'a>(
         &'a self,
         id: &'a ModuleId,
     ) -> BoxFuture<'a, Result<Option<ModuleConfig>, StoreError>>;
 
-    /// Saves all entries or none of them — also if the future is dropped
-    /// before it completes. Records of other modules are left untouched.
+    /// Saves all entries or none of them, also if the future is dropped; a
+    /// dropped call does not tell which. If an id occurs more than once, the
+    /// last entry wins. Records of other modules are left untouched.
     fn save_batch<'a>(
         &'a self,
         entries: &'a [(ModuleId, ModuleConfig)],
     ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Replaces the record of `id` with `config` only if the record stored
+    /// now is damaged; a usable record, or none, is left as it is. The check
+    /// and the write are one atomic step, so nothing can change the record in
+    /// between: the record is checked again here, not taken from an earlier
+    /// `load`. All or nothing, also if the future is dropped; a dropped call
+    /// does not tell which.
+    fn replace_if_damaged<'a>(
+        &'a self,
+        id: &'a ModuleId,
+        config: &'a ModuleConfig,
+    ) -> BoxFuture<'a, Result<ReplaceResult, StoreError>>;
 }
 
-/// Configuration kept in memory for the current run (MM-5A). Clones share the
-/// data, so a test can start a second manager on the same store, as the next
-/// run of the application would.
+/// Configuration kept in memory, for tests: what a run of the application
+/// keeps in SQLite. Clones share the data, so a test can start a second
+/// manager on the same store, as the next run of the application would.
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct InMemoryConfigStore {
-    records: Arc<Mutex<BTreeMap<ModuleId, ModuleConfig>>>,
+    records: Arc<Mutex<Records>>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct Records {
+    configs: BTreeMap<ModuleId, ModuleConfig>,
+    /// Records that exist but are damaged (only tests make them).
+    damaged: BTreeSet<ModuleId>,
+}
+
+/// The text of `load` for a damaged record; names no value.
+#[cfg(test)]
+const DAMAGED: &str = "module configuration record is damaged";
+
+#[cfg(test)]
 impl InMemoryConfigStore {
-    /// A copy of the record of `id`.
+    /// A copy of the record of `id`; `None` for a damaged one.
     pub fn get(&self, id: &ModuleId) -> Option<ModuleConfig> {
-        lock(&self.records).get(id).cloned()
+        lock(&self.records).configs.get(id).cloned()
     }
 
-    /// All records, for tests.
-    #[cfg(test)]
+    /// All usable records.
     pub fn records(&self) -> BTreeMap<ModuleId, ModuleConfig> {
-        lock(&self.records).clone()
+        lock(&self.records).configs.clone()
+    }
+
+    /// Makes the record of `id` damaged, as an outside edit of the database
+    /// could: `load` fails because of its content.
+    pub fn damage(&self, id: &ModuleId) {
+        let mut records = lock(&self.records);
+        records.configs.remove(id);
+        records.damaged.insert(id.clone());
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for InMemoryConfigStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let records = lock(&self.records);
         f.debug_struct("InMemoryConfigStore")
-            .field("records", &lock(&self.records).len())
+            .field("records", &records.configs.len())
+            .field("damaged", &records.damaged.len())
             .finish()
     }
 }
 
+#[cfg(test)]
 impl ModuleConfigStore for InMemoryConfigStore {
     fn load<'a>(
         &'a self,
         id: &'a ModuleId,
     ) -> BoxFuture<'a, Result<Option<ModuleConfig>, StoreError>> {
-        Box::pin(async move { Ok(self.get(id)) })
+        Box::pin(async move {
+            let records = lock(&self.records);
+            if records.damaged.contains(id) {
+                return Err(StoreError(DAMAGED.to_owned()));
+            }
+            Ok(records.configs.get(id).cloned())
+        })
     }
 
     fn save_batch<'a>(
@@ -134,14 +198,34 @@ impl ModuleConfigStore for InMemoryConfigStore {
         Box::pin(async move {
             let mut records = lock(&self.records);
             for (id, config) in entries {
-                records.insert(id.clone(), config.clone());
+                // A written record replaces whatever was there.
+                records.damaged.remove(id);
+                records.configs.insert(id.clone(), config.clone());
             }
             Ok(())
+        })
+    }
+
+    fn replace_if_damaged<'a>(
+        &'a self,
+        id: &'a ModuleId,
+        config: &'a ModuleConfig,
+    ) -> BoxFuture<'a, Result<ReplaceResult, StoreError>> {
+        // The check and the write under one lock, without an await: the same
+        // guarantees as `save_batch`.
+        Box::pin(async move {
+            let mut records = lock(&self.records);
+            if !records.damaged.remove(id) {
+                return Ok(ReplaceResult::NotDamaged);
+            }
+            records.configs.insert(id.clone(), config.clone());
+            Ok(ReplaceResult::Replaced)
         })
     }
 }
 
 /// The records stay usable if a holder panicked: recover the lock.
+#[cfg(test)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -343,6 +427,63 @@ mod tests {
             store.get(&id("old.module")),
             Some(config(true, json!({"k": 1})))
         );
+    }
+
+    #[test]
+    fn the_last_entry_of_an_id_wins() {
+        let store = InMemoryConfigStore::default();
+        let batch = [
+            (id("t.a"), config(true, json!({"v": 1}))),
+            (id("t.a"), config(false, json!({"v": 2}))),
+        ];
+        ready(store.save_batch(&batch)).expect("saved");
+        assert_eq!(store.get(&id("t.a")), Some(config(false, json!({"v": 2}))));
+    }
+
+    #[test]
+    fn a_damaged_record_fails_to_load_without_naming_a_value() {
+        let store = InMemoryConfigStore::default();
+        store.damage(&id("t.a"));
+        let error = ready(store.load(&id("t.a"))).expect_err("damaged");
+        assert_eq!(error, StoreError(DAMAGED.to_owned()));
+        assert_eq!(ready(store.load(&id("t.b"))), Ok(None));
+    }
+
+    #[test]
+    fn only_a_damaged_record_is_replaced() {
+        let store = InMemoryConfigStore::default();
+        ready(store.save_batch(&[(id("t.usable"), config(true, json!({"k": 1})))])).expect("saved");
+        store.damage(&id("t.damaged"));
+        let fresh = config(false, json!({"fresh": true}));
+
+        assert_eq!(
+            ready(store.replace_if_damaged(&id("t.usable"), &fresh)),
+            Ok(ReplaceResult::NotDamaged)
+        );
+        assert_eq!(
+            store.get(&id("t.usable")),
+            Some(config(true, json!({"k": 1})))
+        );
+        assert_eq!(
+            ready(store.replace_if_damaged(&id("t.missing"), &fresh)),
+            Ok(ReplaceResult::NotDamaged)
+        );
+        assert_eq!(store.get(&id("t.missing")), None);
+
+        // Dropped before it ran: nothing changes.
+        drop(store.replace_if_damaged(&id("t.damaged"), &fresh));
+        assert!(ready(store.load(&id("t.damaged"))).is_err());
+        assert_eq!(
+            ready(store.replace_if_damaged(&id("t.damaged"), &fresh)),
+            Ok(ReplaceResult::Replaced)
+        );
+        assert_eq!(ready(store.load(&id("t.damaged"))), Ok(Some(fresh.clone())));
+        // Once replaced, the record is usable: a second call writes nothing.
+        assert_eq!(
+            ready(store.replace_if_damaged(&id("t.damaged"), &config(true, json!({})))),
+            Ok(ReplaceResult::NotDamaged)
+        );
+        assert_eq!(store.get(&id("t.damaged")), Some(fresh));
     }
 
     #[test]

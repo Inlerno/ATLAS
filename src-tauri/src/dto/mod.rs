@@ -22,6 +22,7 @@ pub mod code {
     pub const NOT_READY: &str = "not_ready";
     pub const SHUT_DOWN: &str = "shut_down";
     pub const CONFIG_UNAVAILABLE: &str = "config_unavailable";
+    pub const CONFIG_AVAILABLE: &str = "config_available";
     pub const STORE: &str = "store";
     pub const INTERNAL: &str = "internal";
 }
@@ -99,6 +100,11 @@ impl From<ManagerError> for ErrorDto {
             ManagerError::Store => Self::new(
                 code::STORE,
                 "Не удалось сохранить конфигурацию; изменения не применены",
+            ),
+            ManagerError::ConfigAvailable(_) => Self::new(
+                code::CONFIG_AVAILABLE,
+                "Конфигурация модуля читается, замена не нужна. Если модуль всё ещё \
+                 недоступен, перезапустите приложение",
             ),
         }
     }
@@ -179,6 +185,10 @@ mod tests {
                 code::CONFIG_UNAVAILABLE,
             ),
             (ManagerError::Store, code::STORE),
+            (
+                ManagerError::ConfigAvailable(id("t.a")),
+                code::CONFIG_AVAILABLE,
+            ),
         ];
         for (error, expected) in cases {
             let internal_text = error.to_string();

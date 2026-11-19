@@ -41,10 +41,10 @@ pub fn run() {
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "ATLAS starting");
             // The storage opens the database in the background: `setup` neither
             // waits for SQLite nor fails if the database is unavailable
-            // (ADR-016). Nothing uses the database yet.
+            // (ADR-016). The module configuration waits for its result.
             let storage = Storage::new(app.path().app_local_data_dir().map_err(AppError::from));
             tauri::async_runtime::spawn(storage.open());
-            app.manage(storage);
+            app.manage(storage.clone());
             let events = EventBus::new(DEFAULT_CAPACITY);
             // The bridge subscribes before the manager runs, so the UI is
             // sent every event from the first one (#11).
@@ -52,9 +52,10 @@ pub fn run() {
             tauri::async_runtime::spawn(bridge);
             // The manager loads the module configuration and starts the
             // enabled modules on its own task (#10, ADR-015). The store keeps
-            // the configuration in memory for this run; persistence between
-            // runs arrives with MM-5B.
-            let store = Box::new(modules::config::InMemoryConfigStore::default());
+            // the configuration in SQLite between runs (#21); if the database
+            // does not open within the readiness deadline, every module is
+            // `ConfigUnavailable` for this run.
+            let store = Box::new(modules::config_sqlite::SqliteConfigStore::new(storage));
             let (modules, manager) =
                 modules::manager::create(modules::catalog(), store, events.clone());
             tauri::async_runtime::spawn(manager);

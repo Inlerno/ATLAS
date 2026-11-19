@@ -788,6 +788,7 @@ mod tests {
             code::NOT_READY,
             code::SHUT_DOWN,
             code::CONFIG_UNAVAILABLE,
+            code::CONFIG_AVAILABLE,
             code::STORE,
             code::INTERNAL,
         ] {

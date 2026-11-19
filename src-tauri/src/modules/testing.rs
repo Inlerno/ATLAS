@@ -23,7 +23,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
-use super::config::{InMemoryConfigStore, ModuleConfig, ModuleConfigStore, StoreError};
+use super::config::{
+    InMemoryConfigStore, ModuleConfig, ModuleConfigStore, ReplaceResult, StoreError,
+};
 use super::context::ModuleContext;
 use super::contract::{
     BoxFuture, Health, Module, ModuleDescriptor, ModuleFactory, ModuleFailure, ModuleId,
@@ -459,6 +461,8 @@ pub struct StoreControl {
     loads: Mutex<Vec<ModuleId>>,
     /// Every batch the manager tried to save: (module, enabled) pairs.
     batches: Mutex<Vec<Vec<(ModuleId, bool)>>>,
+    /// Every conditional replacement the manager tried.
+    replacements: Mutex<Vec<ModuleId>>,
 }
 
 /// The in-memory store with injected failures. Clones share everything, so
@@ -485,6 +489,20 @@ impl TestStore {
 
     pub fn records(&self) -> BTreeMap<ModuleId, ModuleConfig> {
         self.inner.records()
+    }
+
+    /// Makes the stored record of `module` damaged: `load` fails because of
+    /// its content, and `replace_if_damaged` replaces it.
+    pub fn damage(&self, module: &str) {
+        self.inner.damage(&id(module));
+    }
+
+    /// Modules the manager tried to replace, in order.
+    pub fn replacements(&self) -> Vec<String> {
+        lock(&self.control.replacements)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     pub fn fail_load(&self, module: &str) {
@@ -571,6 +589,26 @@ impl ModuleConfigStore for TestStore {
             }
             // Atomic: the inner save never waits.
             self.inner.save_batch(entries).await
+        })
+    }
+
+    /// Fails and hangs like a save (`fail_saves`, `hang_saves`).
+    fn replace_if_damaged<'a>(
+        &'a self,
+        id: &'a ModuleId,
+        config: &'a ModuleConfig,
+    ) -> BoxFuture<'a, Result<ReplaceResult, StoreError>> {
+        Box::pin(async move {
+            lock(&self.control.replacements).push(id.clone());
+            if self.control.hang_save.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.control.fail_save.load(Ordering::SeqCst) {
+                return Err(StoreError(
+                    "fake write error in /secret/path/config.db".to_owned(),
+                ));
+            }
+            self.inner.replace_if_damaged(id, config).await
         })
     }
 }

@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::config::{ModuleConfig, ModuleConfigStore, check_settings};
+use super::config::{ModuleConfig, ModuleConfigStore, ReplaceResult, check_settings};
 use super::context::{ModuleContext, TaskFailure, panic_text};
 use super::contract::{
     BlockReason, FailurePhase, Health, Module, ModuleDescriptor, ModuleError, ModuleFactory,
@@ -95,10 +95,28 @@ pub enum ManagerError {
     /// its settings are unknown (#10).
     #[error("the configuration of module `{0}` could not be read")]
     ConfigUnavailable(ModuleId),
-    /// The configuration could not be saved; nothing was changed. Details are
-    /// in the log (#10).
+    /// The configuration could not be saved: nothing changed in memory, and
+    /// in the store either nothing changed or — if the exit deadline cut the
+    /// write short — the outcome is known only at the next start. Details are
+    /// in the log (#10, #21).
     #[error("the module configuration could not be saved")]
     Store,
+    /// `replace_config` found the configuration of the module readable: the
+    /// module is not `ConfigUnavailable`, or its stored record turned out
+    /// usable or absent when checked again. Nothing is replaced; a module that
+    /// stays `ConfigUnavailable` reads its record again at the next start
+    /// (#21).
+    #[error("the configuration of module `{0}` is readable: nothing to replace")]
+    ConfigAvailable(ModuleId),
+}
+
+/// Result of `replace_config` (#21). Only `Replaced` changed anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    /// The damaged record was replaced; the module is disabled and stopped.
+    Replaced,
+    /// Nothing changed: the replacement needs an explicit confirmation.
+    ConfirmationRequired,
 }
 
 /// Settings of a module as the manager keeps them (#10).
@@ -330,6 +348,30 @@ impl ModuleManagerHandle {
         .await?
     }
 
+    /// Replaces the damaged configuration record of a `ConfigUnavailable`
+    /// module with `settings`, disabled, after an explicit confirmation
+    /// (#21, ADR-015). Only a record proven damaged is replaced: the store
+    /// checks it again in the same atomic step, and a readable or absent
+    /// record is left as it is (`ConfigAvailable`). The module stays
+    /// disabled; its dependents stay blocked until a confirmed `recover`. On
+    /// any error nothing changes in memory.
+    // Stage C of #21: the IPC command (stage D) is the caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn replace_config(
+        &self,
+        id: ModuleId,
+        settings: Value,
+        confirmed: bool,
+    ) -> Result<ReplaceOutcome, ManagerError> {
+        self.request(|reply| Command::ReplaceConfig {
+            id,
+            settings,
+            confirmed,
+            reply,
+        })
+        .await?
+    }
+
     /// Applies `action` to `target` if `verify` approves `confirmation` for
     /// the plan as it is now; otherwise nothing changes.
     pub async fn apply(
@@ -481,6 +523,14 @@ pub(super) enum Command {
         settings: Value,
         reply: oneshot::Sender<Result<(), ManagerError>>,
     },
+    // Stage C of #21: the IPC command (stage D) is the caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ReplaceConfig {
+        id: ModuleId,
+        settings: Value,
+        confirmed: bool,
+        reply: oneshot::Sender<Result<ReplaceOutcome, ManagerError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<StopReport>,
     },
@@ -612,6 +662,15 @@ impl Actor {
                 reply,
             } => {
                 let result = self.update_settings(&id, settings).await;
+                let _ = reply.send(result);
+            }
+            Command::ReplaceConfig {
+                id,
+                settings,
+                confirmed,
+                reply,
+            } => {
+                let result = self.replace_config(&id, settings, confirmed).await;
                 let _ = reply.send(result);
             }
             Command::TaskFailed {
@@ -1000,7 +1059,9 @@ impl Actor {
     }
 
     /// One atomic write, waited for until the exit deadline. On an error or
-    /// at the deadline nothing in memory changes.
+    /// at the deadline nothing in memory changes; at the deadline the store
+    /// may or may not have saved the batch (it is all or nothing), which the
+    /// next start finds out.
     async fn save(&self, batch: &[(ModuleId, ModuleConfig)]) -> Result<(), ManagerError> {
         if batch.is_empty() {
             return Ok(());
@@ -1018,7 +1079,7 @@ impl Actor {
                 Err(ManagerError::Store)
             }
             None => {
-                tracing::error!(modules = %modules.join(", "), "module configuration not saved before the exit deadline: nothing changed");
+                tracing::error!(modules = %modules.join(", "), "module configuration write not confirmed before the exit deadline: memory unchanged, stored outcome unknown until the next start");
                 Err(ManagerError::Store)
             }
         }
@@ -1077,6 +1138,92 @@ impl Actor {
             restart_required,
         });
         Ok(())
+    }
+
+    /// `replace_config` (#21, plan of MM-5, 3.9): refused after the exit
+    /// request, for an unknown module and for one that is not
+    /// `ConfigUnavailable`; nothing without confirmation; then the checks of
+    /// the settings, then the conditional replacement in the store. Only
+    /// after it, one update of the registry and the snapshot — status and
+    /// settings together, so the snapshot never shows loaded settings for a
+    /// `ConfigUnavailable` module — then `SettingsChanged`, then
+    /// `StatusChanged`. Dependents stay blocked until a confirmed `recover`.
+    async fn replace_config(
+        &mut self,
+        id: &ModuleId,
+        settings: Value,
+        confirmed: bool,
+    ) -> Result<ReplaceOutcome, ManagerError> {
+        if self.shutdown.requested.is_cancelled() {
+            return Err(ManagerError::ShutDown);
+        }
+        if !self.graph.contains(id) {
+            return Err(ModuleError::UnknownModule(id.clone()).into());
+        }
+        if !matches!(self.state(id), ModuleState::ConfigUnavailable { .. }) {
+            return Err(ManagerError::ConfigAvailable(id.clone()));
+        }
+        if !confirmed {
+            return Ok(ReplaceOutcome::ConfirmationRequired);
+        }
+        if let Err(reason) = self.validate(id, &settings) {
+            tracing::warn!(module = %id, %reason, "replacement settings rejected");
+            return Err(ModuleError::InvalidSettings {
+                module: id.clone(),
+                reason,
+            }
+            .into());
+        }
+        let config = ModuleConfig {
+            enabled: false,
+            settings: settings.clone(),
+        };
+        match self
+            .shutdown
+            .expired
+            .run_until_cancelled(self.store.replace_if_damaged(id, &config))
+            .await
+        {
+            Some(Ok(ReplaceResult::Replaced)) => {}
+            Some(Ok(ReplaceResult::NotDamaged)) => {
+                tracing::warn!(module = %id, "module configuration not replaced: the stored record is readable or absent; it is read again at the next start");
+                return Err(ManagerError::ConfigAvailable(id.clone()));
+            }
+            Some(Err(error)) => {
+                tracing::error!(module = %id, %error, "module configuration not replaced: nothing changed");
+                return Err(ManagerError::Store);
+            }
+            None => {
+                tracing::error!(module = %id, "module configuration replacement not confirmed before the exit deadline: memory unchanged, stored outcome unknown until the next start");
+                return Err(ManagerError::Store);
+            }
+        }
+        self.problems.remove(id);
+        self.settings.insert(
+            id.clone(),
+            SettingsEntry::Loaded {
+                value: Arc::new(settings),
+                valid: true,
+            },
+        );
+        let current = ModuleStatus {
+            enabled: Some(false),
+            state: ModuleState::Stopped,
+        };
+        let previous = self.record_status(id, current.clone());
+        tracing::info!(module = %id, "module configuration replaced: the module is disabled");
+        self.publish(ModuleEvent::SettingsChanged {
+            id: id.clone(),
+            restart_required: false,
+        });
+        if let Some(previous) = previous {
+            self.publish(ModuleEvent::StatusChanged {
+                id: id.clone(),
+                previous,
+                current,
+            });
+        }
+        Ok(ReplaceOutcome::Replaced)
     }
 
     async fn execute(&mut self, plan: &ChangePlan) -> ApplyReport {
@@ -1791,13 +1938,27 @@ impl Actor {
         instance.context.settings_arc().as_ref() != value.as_ref()
     }
 
-    /// The only place where a status changes: the registry and the snapshot
-    /// are updated first, then the change is announced on the bus, so a
-    /// subscriber that reads the snapshot sees at least this change.
+    /// A status change: the registry and the snapshot are updated first, then
+    /// the change is announced on the bus, so a subscriber that reads the
+    /// snapshot sees at least this change.
     fn set_status(&mut self, id: &ModuleId, current: ModuleStatus) {
+        if let Some(previous) = self.record_status(id, current.clone()) {
+            self.publish(ModuleEvent::StatusChanged {
+                id: id.clone(),
+                previous,
+                current,
+            });
+        }
+    }
+
+    /// The only place where a status changes: updates the registry and the
+    /// snapshot (with the settings of the module as they are now) and
+    /// returns the previous status, or `None` if nothing changed. The caller
+    /// announces the change ([`Self::set_status`]).
+    fn record_status(&mut self, id: &ModuleId, current: ModuleStatus) -> Option<ModuleStatus> {
         let previous = self.statuses.get(id).cloned().unwrap_or_default();
         if previous == current {
-            return;
+            return None;
         }
         if !current.is_consistent() {
             tracing::error!(module = %id, status = ?current, "inconsistent module status");
@@ -1811,14 +1972,10 @@ impl Actor {
             !self.exiting || self.stopping_all,
             "status of module `{id}` changed in exit mode outside shutdown_all"
         );
-        self.statuses.insert(id.clone(), current.clone());
-        self.refresh(id);
         tracing::info!(module = %id, enabled = ?current.enabled, state = ?current.state, "module status changed");
-        self.publish(ModuleEvent::StatusChanged {
-            id: id.clone(),
-            previous,
-            current,
-        });
+        self.statuses.insert(id.clone(), current);
+        self.refresh(id);
+        Some(previous)
     }
 
     fn publish(&self, event: ModuleEvent) {
@@ -1875,6 +2032,10 @@ fn exit_message(
         }
         Command::UpdateSettings { id, reply, .. } => {
             tracing::debug!(module = %id, "settings update refused: the application is exiting");
+            let _ = reply.send(Err(ManagerError::ShutDown));
+        }
+        Command::ReplaceConfig { id, reply, .. } => {
+            tracing::debug!(module = %id, "configuration replacement refused: the application is exiting");
             let _ = reply.send(Err(ManagerError::ShutDown));
         }
         Command::TaskFailed {

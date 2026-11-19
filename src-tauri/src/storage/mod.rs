@@ -17,6 +17,8 @@ mod database;
 mod migrations;
 mod module_config;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
 
 pub use module_config::{ConfigStoreError, ReplaceCheck, StoredModuleConfig};
@@ -93,12 +95,9 @@ struct Inner {
     /// whoever wakes up on it then takes the lock and finds the final state.
     outcome: SetOnce<Outcome>,
     /// How long the operations wait for `outcome` ([`READINESS_TIMEOUT`]).
-    // Stage A of #21: the module configuration adapter (stage B) is the caller.
-    #[cfg_attr(not(test), allow(dead_code))]
     readiness_timeout: Duration,
     /// The one readiness deadline of the session, set by the first operation
     /// that waits.
-    #[cfg_attr(not(test), allow(dead_code))]
     readiness_deadline: OnceLock<Instant>,
     /// The deadline passed without a result: no operation runs for the rest
     /// of the session, whatever the opening does later.
@@ -287,8 +286,6 @@ impl Storage {
 // Module configuration (MM-5B, #21)
 // ---------------------------------------------------------------------------
 
-// Stage A of #21: the module configuration adapter (stage B) is the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 /// Whether an operation reads only or also writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Purpose {
@@ -296,8 +293,6 @@ enum Purpose {
     Write,
 }
 
-// Stage A of #21: the module configuration adapter (stage B) is the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 impl Storage {
     /// The stored configuration of the module `id`, or `None` if there is
     /// none. Works on a read-only database too.
@@ -376,8 +371,6 @@ impl Storage {
     }
 }
 
-// Stage A of #21: the module configuration adapter (stage B) is the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 /// The connection of an open state; [`Storage::usable`] has checked it.
 fn connection<'a>(
     state: &'a mut MutexGuard<'_, State>,
