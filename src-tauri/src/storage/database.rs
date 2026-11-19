@@ -62,8 +62,8 @@
 //! the stray file is left beside a database it no longer matches. A `-wal`
 //! file that appears while the session runs is attached by the next
 //! transaction, which then sees foreign content: whoever reads or writes
-//! through this connection later (MM-5B) must make the same check inside each
-//! of its transactions.
+//! through this connection later must make the same check inside each of its
+//! transactions — the module configuration does (`module_config`).
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
@@ -452,7 +452,7 @@ async fn require_rollback_journal(
 /// Begins a transaction and checks, inside it, that it runs on the rollback
 /// journal (module documentation, "Why inside the transaction"). On any
 /// failure the transaction is rolled back before the error is returned.
-async fn begin_on_rollback_journal<'c>(
+pub(super) async fn begin_on_rollback_journal<'c>(
     conn: &'c mut SqliteConnection,
     step: &str,
 ) -> Result<Transaction<'c, Sqlite>, StorageError> {
@@ -607,7 +607,7 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    fn of(error: &sqlx::Error) -> Self {
+    pub(super) fn of(error: &sqlx::Error) -> Self {
         match error {
             // sqlx reports the extended result code as a decimal string.
             sqlx::Error::Database(database) => Self {
@@ -657,7 +657,7 @@ fn unavailable(step: &str, failure: &Failure) -> StorageError {
     StorageError::Open(describe(step, failure))
 }
 
-fn describe(step: &str, failure: &Failure) -> String {
+pub(super) fn describe(step: &str, failure: &Failure) -> String {
     match failure.code {
         Some(code) => format!("step={step} code={code} message={}", failure.message),
         None => format!("step={step} error={}", failure.message),

@@ -27,9 +27,15 @@ pub(super) struct Embedded {
     pub sql: &'static str,
 }
 
-/// The product migrations. Empty in the SQLite foundation: the first
-/// application table (`module_config`) arrives with MM-5B.
-pub(super) const MIGRATIONS: &[Embedded] = &[];
+/// The product migrations.
+pub(super) const MIGRATIONS: &[Embedded] = &[
+    // MM-5B (#21): the configuration of the modules, one row per module.
+    Embedded {
+        version: 1,
+        name: "module_config",
+        sql: include_str!("../../migrations/0001_module_config.sql"),
+    },
+];
 
 // A product list that breaks the rules does not compile.
 const _: () = assert!(

@@ -20,7 +20,7 @@ use super::database::{
     Opened, SHM_SUFFIX, Settings, Verdict, WAL_SUFFIX, classify_probe,
 };
 use super::migrations::{self, Embedded, MIGRATIONS, list_defect};
-use super::{State, Storage, StorageError};
+use super::{ConfigStoreError, ReplaceCheck, State, Storage, StorageError, StoredModuleConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1933,11 +1933,14 @@ fn invalid_list_is_refused_before_anything_is_applied() {
 
 #[test]
 fn product_list_matches_the_migrations_directory() {
-    // No product migrations in the SQLite foundation: no directory either.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     assert_eq!(files_defect(MIGRATIONS, &dir), Ok(()));
-    assert!(MIGRATIONS.is_empty());
-    assert!(!dir.exists());
+    // MM-5B: the module configuration table.
+    assert_eq!(MIGRATIONS.len(), 1);
+    assert_eq!(
+        migrations::file_name(&MIGRATIONS[0]),
+        "0001_module_config.sql"
+    );
 }
 
 #[test]
@@ -2560,6 +2563,743 @@ fn opening_that_starts_after_a_given_up_close_opens_nothing() {
         assert!(!layout.data_dir.exists());
         assert!(!layout.marker.exists());
         assert!(!layout.lock.exists());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Module configuration (MM-5B, #21): the product migration
+// ---------------------------------------------------------------------------
+
+async fn module_rows(layout: &Layout) -> Vec<(String, i64, String)> {
+    let mut conn = raw(layout).await;
+    let rows =
+        sqlx::query_as("SELECT module_id, enabled, settings FROM module_config ORDER BY module_id")
+            .fetch_all(&mut conn)
+            .await
+            .expect("module rows");
+    conn.close().await.expect("close");
+    rows
+}
+
+/// Stores a row as an outside edit could, with the checks of the schema
+/// switched off for that one connection.
+async fn plant_row(layout: &Layout, id: &str, enabled: i64, settings: &str) {
+    let mut conn = raw(layout).await;
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut conn)
+        .await
+        .expect("checks off");
+    sqlx::query("INSERT INTO module_config (module_id, enabled, settings) VALUES (?1, ?2, ?3)")
+        .bind(id)
+        .bind(enabled)
+        .bind(settings)
+        .execute(&mut conn)
+        .await
+        .expect("plant row");
+    conn.close().await.expect("close");
+}
+
+fn row(id: &str, enabled: i64, settings: &str) -> (String, i64, String) {
+    (id.to_owned(), enabled, settings.to_owned())
+}
+
+#[test]
+fn product_migration_creates_a_strict_module_config_table() {
+    run(async {
+        let root = TempRoot::new("product-migration");
+        let layout = root.layout();
+        assert_eq!(
+            session(&layout, MIGRATIONS).await,
+            (Access::ReadWrite, true, 1)
+        );
+        let mut conn = raw(&layout).await;
+        for (sql, what) in [
+            (
+                "INSERT INTO module_config VALUES ('a', 1, '{}')",
+                "valid row",
+            ),
+            (
+                "INSERT INTO module_config VALUES ('b', 0, '[1]')",
+                "valid row",
+            ),
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.expect(what);
+        }
+        for sql in [
+            // STRICT: no value that cannot be converted without loss.
+            "INSERT INTO module_config VALUES ('c', 'yes', '{}')",
+            "INSERT INTO module_config VALUES (X'61', 1, '{}')",
+            "INSERT INTO module_config VALUES ('g', 1, X'7B7D')",
+            // The checks.
+            "INSERT INTO module_config VALUES ('d', 2, '{}')",
+            "INSERT INTO module_config VALUES ('e', 1, 'not json')",
+            "INSERT INTO module_config VALUES ('f', 1, NULL)",
+            // One row per module.
+            "INSERT INTO module_config VALUES ('a', 0, '{}')",
+        ] {
+            assert!(sqlx::query(sql).execute(&mut conn).await.is_err(), "{sql}");
+        }
+        conn.close().await.expect("close");
+        assert_eq!(
+            module_rows(&layout).await,
+            vec![row("a", 1, "{}"), row("b", 0, "[1]")]
+        );
+    });
+}
+
+#[test]
+fn foundation_database_gets_the_table_once() {
+    run(async {
+        let root = TempRoot::new("product-migration-upgrade");
+        let layout = root.layout();
+        // A database of the SQLite foundation: no product migrations.
+        assert_eq!(session(&layout, NONE).await, (Access::ReadWrite, true, 0));
+        assert_eq!(
+            session(&layout, MIGRATIONS).await,
+            (Access::ReadWrite, false, 1)
+        );
+        assert_eq!(
+            session(&layout, MIGRATIONS).await,
+            (Access::ReadWrite, false, 0)
+        );
+        let mut conn = raw(&layout).await;
+        assert_eq!(applied_versions(&mut conn).await, vec![1]);
+        conn.close().await.expect("close");
+        assert!(module_rows(&layout).await.is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Module configuration: waiting for the opening
+// ---------------------------------------------------------------------------
+
+fn storage_waiting(root: &TempRoot, readiness: Duration) -> Storage {
+    Storage::with_readiness(
+        Ok(root.path().to_path_buf()),
+        Settings::new(MIGRATIONS),
+        readiness,
+    )
+}
+
+async fn product(root: &TempRoot) -> Storage {
+    let storage = Storage::for_test(root.path(), MIGRATIONS);
+    storage.open().await;
+    assert_eq!(storage.kind().await, "ready");
+    storage
+}
+
+/// The three operations at once, each in a task of its own, as the module
+/// manager could issue them before the opening has a result.
+fn three_operations(
+    storage: &Storage,
+) -> Vec<tokio::task::JoinHandle<Result<(), ConfigStoreError>>> {
+    let read = {
+        let storage = storage.clone();
+        tokio::spawn(async move { storage.read_module_config("a").await.map(drop) })
+    };
+    let write = {
+        let storage = storage.clone();
+        tokio::spawn(async move { storage.write_module_configs(&[("a", true, "{}")]).await })
+    };
+    let replace = {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            storage
+                .replace_module_config_if("a", false, "{}", |_| true)
+                .await
+                .map(drop)
+        })
+    };
+    vec![read, write, replace]
+}
+
+async fn results(
+    tasks: Vec<tokio::task::JoinHandle<Result<(), ConfigStoreError>>>,
+) -> Vec<Result<(), ConfigStoreError>> {
+    let mut found = Vec::new();
+    for task in tasks {
+        found.push(task.await.expect("operation task"));
+    }
+    found
+}
+
+#[test]
+fn operations_issued_before_the_opening_wait_for_its_result() {
+    run(async {
+        let root = TempRoot::new("config-before-open");
+        // A long deadline: the operations must not need it.
+        let storage = storage_waiting(&root, Duration::from_secs(30));
+        let tasks = three_operations(&storage);
+        tokio::task::yield_now().await;
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+
+        // They wait without the state lock: the opening gets it and finishes.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), storage.open())
+            .await
+            .expect("the opening is not blocked by waiting operations");
+        assert_eq!(results(tasks).await, vec![Ok(()), Ok(()), Ok(())]);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(module_rows(&root.layout()).await.len(), 1);
+        storage.close().await;
+    });
+}
+
+#[test]
+fn every_waiting_operation_gets_the_same_failed_result() {
+    run(async {
+        let root = TempRoot::new("config-unavailable");
+        // A marker without a database: the opening is unavailable.
+        fs::write(root.layout().marker, b"").expect("marker");
+        let storage = storage_waiting(&root, Duration::from_secs(30));
+        let tasks = three_operations(&storage);
+        tokio::task::yield_now().await;
+        storage.open().await;
+        assert_eq!(
+            results(tasks).await,
+            vec![Err(ConfigStoreError::Unavailable); 3]
+        );
+        // And every later one, at once.
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Err(ConfigStoreError::Unavailable)
+        );
+        storage.close().await;
+    });
+}
+
+#[test]
+fn close_before_the_opening_ends_the_wait_at_once() {
+    run(async {
+        let root = TempRoot::new("config-close-first");
+        let storage = storage_waiting(&root, Duration::from_secs(30));
+        let tasks = three_operations(&storage);
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        storage.close().await;
+        assert_eq!(results(tasks).await, vec![Err(ConfigStoreError::Closed); 3]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        storage.open().await;
+        assert_eq!(storage.kind().await, "closed");
+        assert!(!root.layout().data_dir.exists());
+    });
+}
+
+#[test]
+fn close_during_the_opening_gives_closed_to_waiting_operations() {
+    run(async {
+        let root = TempRoot::new("config-close-during-open");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        // Another program holds the file: the opening waits in its read check.
+        let mut other = raw(&layout).await;
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut other)
+            .await
+            .expect("exclusive lock");
+        let mut settings = Settings::new(MIGRATIONS);
+        settings.busy_timeout = Some(Duration::from_secs(30));
+        let storage = Storage::with_readiness(
+            Ok(root.path().to_path_buf()),
+            settings,
+            Duration::from_secs(30),
+        );
+        let opening = tokio::spawn(storage.open());
+        tokio::task::yield_now().await;
+        let tasks = three_operations(&storage);
+        let closing = {
+            let storage = storage.clone();
+            tokio::spawn(async move { storage.close().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sqlx::query("ROLLBACK")
+            .execute(&mut other)
+            .await
+            .expect("rollback");
+        other.close().await.expect("close");
+
+        opening.await.expect("opening task");
+        closing.await.expect("closing task");
+        assert_eq!(results(tasks).await, vec![Err(ConfigStoreError::Closed); 3]);
+        assert!(module_rows(&layout).await.is_empty());
+    });
+}
+
+#[test]
+fn aborted_opening_ends_the_wait_at_the_readiness_deadline() {
+    run(async {
+        let root = TempRoot::new("config-aborted-open");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        let mut other = raw(&layout).await;
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut other)
+            .await
+            .expect("exclusive lock");
+        let mut settings = Settings::new(MIGRATIONS);
+        settings.busy_timeout = Some(Duration::from_secs(30));
+        let storage = Storage::with_readiness(
+            Ok(root.path().to_path_buf()),
+            settings,
+            Duration::from_millis(300),
+        );
+        let opening = tokio::spawn(storage.open());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        opening.abort();
+        assert!(opening.await.expect_err("aborted").is_cancelled());
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Err(ConfigStoreError::ReadinessExpired)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(storage.kind().await, "pending");
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut other)
+            .await
+            .expect("rollback");
+        other.close().await.expect("close");
+    });
+}
+
+#[test]
+fn a_second_opening_changes_nothing_for_the_operations() {
+    run(async {
+        let root = TempRoot::new("config-second-open");
+        let storage = product(&root).await;
+        storage.open().await;
+        storage
+            .write_module_configs(&[("a", true, "{}")])
+            .await
+            .expect("write");
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Ok(Some(StoredModuleConfig {
+                enabled: 1,
+                settings: "{}".to_owned()
+            }))
+        );
+        storage.close().await;
+    });
+}
+
+#[test]
+fn late_opening_after_the_readiness_deadline_stays_unusable_for_the_session() {
+    let root = TempRoot::new("config-late-open");
+    let layout = root.layout();
+    let logs = crate::modules::testing::capture_logs(|| {
+        run(async {
+            session(&layout, MIGRATIONS).await;
+            let mut other = raw(&layout).await;
+            sqlx::query("BEGIN EXCLUSIVE")
+                .execute(&mut other)
+                .await
+                .expect("exclusive lock");
+            let mut settings = Settings::new(MIGRATIONS);
+            settings.busy_timeout = Some(Duration::from_secs(30));
+            let storage = Storage::with_readiness(
+                Ok(root.path().to_path_buf()),
+                settings,
+                Duration::from_millis(200),
+            );
+            let opening = tokio::spawn(storage.open());
+            assert_eq!(
+                storage.read_module_config("a").await,
+                Err(ConfigStoreError::ReadinessExpired)
+            );
+
+            // The opening goes on and succeeds after the deadline.
+            sqlx::query("ROLLBACK")
+                .execute(&mut other)
+                .await
+                .expect("rollback");
+            other.close().await.expect("close");
+            opening.await.expect("opening task");
+            assert_eq!(storage.kind().await, "ready");
+
+            // Still nothing for the rest of the session, at once.
+            let started = std::time::Instant::now();
+            assert_eq!(
+                storage.read_module_config("a").await,
+                Err(ConfigStoreError::ReadinessExpired)
+            );
+            assert_eq!(
+                storage.write_module_configs(&[("a", true, "{}")]).await,
+                Err(ConfigStoreError::ReadinessExpired)
+            );
+            assert_eq!(
+                storage
+                    .replace_module_config_if("a", false, "{}", |_| true)
+                    .await,
+                Err(ConfigStoreError::ReadinessExpired)
+            );
+            assert!(started.elapsed() < Duration::from_millis(100));
+            storage.close().await;
+        });
+    });
+    run(async { assert!(module_rows(&layout).await.is_empty(), "nothing was written") });
+    let deadline = crate::modules::testing::log_line(&logs, "storage readiness deadline passed");
+    assert!(deadline.contains("ERROR"), "{deadline}");
+    assert!(deadline.contains("limit_ms=200"), "{deadline}");
+    let late =
+        crate::modules::testing::log_line(&logs, "database opened after the readiness deadline");
+    assert!(late.contains("WARN"), "{late}");
+}
+
+// ---------------------------------------------------------------------------
+// Module configuration: the operations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn written_configuration_is_read_back_after_a_reopening() {
+    run(async {
+        let root = TempRoot::new("config-roundtrip");
+        let storage = product(&root).await;
+        storage
+            .write_module_configs(&[("a", true, r#"{"x":1}"#), ("b", false, "{}")])
+            .await
+            .expect("write");
+        storage.close().await;
+
+        let storage = product(&root).await;
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Ok(Some(StoredModuleConfig {
+                enabled: 1,
+                settings: r#"{"x":1}"#.to_owned()
+            }))
+        );
+        assert_eq!(
+            storage.read_module_config("b").await,
+            Ok(Some(StoredModuleConfig {
+                enabled: 0,
+                settings: "{}".to_owned()
+            }))
+        );
+        assert_eq!(storage.read_module_config("c").await, Ok(None));
+        storage.close().await;
+    });
+}
+
+#[test]
+fn a_batch_is_saved_completely_or_not_at_all() {
+    run(async {
+        let root = TempRoot::new("config-batch");
+        let layout = root.layout();
+        let storage = product(&root).await;
+        // The second entry breaks a check of the schema.
+        let error = storage
+            .write_module_configs(&[("a", true, "{}"), ("b", true, "not json")])
+            .await
+            .expect_err("the batch is refused");
+        let ConfigStoreError::Database(text) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            text.starts_with("step=config-write-upsert code=275 "),
+            "{text}"
+        );
+        assert!(!text.contains("not json"), "no value in the error: {text}");
+        assert!(module_rows(&layout).await.is_empty());
+        // The connection is not left inside a transaction.
+        storage
+            .write_module_configs(&[("a", true, "{}")])
+            .await
+            .expect("the next batch");
+        assert_eq!(module_rows(&layout).await, vec![row("a", 1, "{}")]);
+        storage.close().await;
+    });
+}
+
+#[test]
+fn the_last_entry_of_an_id_wins() {
+    run(async {
+        let root = TempRoot::new("config-duplicates");
+        let storage = product(&root).await;
+        storage
+            .write_module_configs(&[("a", true, r#"{"v":1}"#), ("a", false, r#"{"v":2}"#)])
+            .await
+            .expect("write");
+        assert_eq!(
+            module_rows(&root.layout()).await,
+            vec![row("a", 0, r#"{"v":2}"#)]
+        );
+        storage.close().await;
+    });
+}
+
+#[test]
+fn rows_of_other_modules_are_left_untouched() {
+    run(async {
+        let root = TempRoot::new("config-others");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "unknown.module", 1, r#"{"keep":true}"#).await;
+        plant_row(&layout, "z", 0, "not json").await;
+        let storage = product(&root).await;
+        storage
+            .write_module_configs(&[("a", true, "{}")])
+            .await
+            .expect("write");
+        storage.close().await;
+        assert_eq!(
+            module_rows(&layout).await,
+            vec![
+                row("a", 1, "{}"),
+                row("unknown.module", 1, r#"{"keep":true}"#),
+                row("z", 0, "not json"),
+            ]
+        );
+    });
+}
+
+#[test]
+fn an_empty_batch_does_nothing_and_waits_for_nothing() {
+    run(async {
+        let root = TempRoot::new("config-empty");
+        // Never opened.
+        let storage = storage_waiting(&root, Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        assert_eq!(storage.write_module_configs(&[]).await, Ok(()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!root.layout().data_dir.exists());
+    });
+}
+
+#[test]
+fn read_only_database_is_read_but_never_written() {
+    run(async {
+        let root = TempRoot::new("config-read-only");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, "{}").await;
+        plant_row(&layout, "b", 1, "not json").await;
+        let before = data_files(&layout);
+
+        let mut settings = Settings::new(MIGRATIONS);
+        settings.read_only_handle = true;
+        let storage = Storage::with_settings(Ok(root.path().to_path_buf()), settings);
+        storage.open().await;
+        assert_eq!(storage.kind().await, "read-only");
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Ok(Some(StoredModuleConfig {
+                enabled: 1,
+                settings: "{}".to_owned()
+            }))
+        );
+        assert_eq!(
+            storage.write_module_configs(&[("a", false, "{}")]).await,
+            Err(ConfigStoreError::ReadOnly)
+        );
+        assert_eq!(
+            storage
+                .replace_module_config_if("b", false, "{}", |_| true)
+                .await,
+            Err(ConfigStoreError::ReadOnly)
+        );
+        storage.close().await;
+        assert_eq!(data_files(&layout), before);
+    });
+}
+
+#[test]
+fn operations_check_the_journal_mode_inside_their_transaction() {
+    run(async {
+        let root = TempRoot::new("config-wal");
+        let elsewhere = TempRoot::new("config-wal-source");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, "not json").await;
+        let (wal, _shm) = real_wal_for(&layout, elsewhere.path()).await;
+        let database = fs::read(&layout.database).expect("database");
+
+        let storage = product(&root).await;
+        // A WAL file appears while the session runs (ADR-016, known limit):
+        // each operation finds it inside its transaction and does nothing.
+        fs::write(&layout.wal, &wal).expect("plant mid-session");
+        for (operation, step) in [
+            ("read", "config-read-journal-mode"),
+            ("write", "config-write-journal-mode"),
+            ("replace", "config-replace-journal-mode"),
+        ] {
+            let result = match operation {
+                "read" => storage.read_module_config("a").await.map(drop),
+                "write" => storage.write_module_configs(&[("a", false, "{}")]).await,
+                _ => storage
+                    .replace_module_config_if("a", false, "{}", |_| true)
+                    .await
+                    .map(drop),
+            };
+            let Err(ConfigStoreError::Database(text)) = result else {
+                panic!("{operation}: {result:?}");
+            };
+            assert!(
+                text.starts_with(&format!("step={step} mode=wal ")),
+                "{text}"
+            );
+        }
+        storage.close().await;
+        assert_eq!(fs::read(&layout.database).expect("database"), database);
+        assert_eq!(fs::read(&layout.wal).expect("wal"), wal);
+        assert!(!database_alone_has_planted(&layout).await);
+    });
+}
+
+/// Decision O-13: a write that meets another connection's write transaction
+/// fails at once. The operations read before they write, so SQLite does not
+/// call the busy handler (it could deadlock) and returns `SQLITE_BUSY`.
+#[test]
+fn a_busy_database_fails_a_write_at_once_and_changes_nothing() {
+    run(async {
+        let root = TempRoot::new("config-busy");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, "not json").await;
+        // The default busy timeout of 5 s: the operations must not use it.
+        let storage = product(&root).await;
+        let mut other = raw(&layout).await;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut other)
+            .await
+            .expect("the other connection takes the write lock");
+
+        let started = std::time::Instant::now();
+        let write = storage.write_module_configs(&[("b", true, "{}")]).await;
+        let replace = storage
+            .replace_module_config_if("a", false, "{}", |_| true)
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(2), "no waiting");
+        for result in [write.map(drop), replace.map(drop)] {
+            let Err(ConfigStoreError::Database(text)) = result else {
+                panic!("{result:?}");
+            };
+            assert!(text.contains(" code=5 "), "SQLITE_BUSY: {text}");
+        }
+        // Reading is not blocked by a write lock.
+        assert_eq!(
+            storage.read_module_config("a").await,
+            Ok(Some(StoredModuleConfig {
+                enabled: 1,
+                settings: "not json".to_owned()
+            }))
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut other)
+            .await
+            .expect("rollback");
+        other.close().await.expect("close");
+        assert_eq!(module_rows(&layout).await, vec![row("a", 1, "not json")]);
+        // Nothing is retried; the next operation works.
+        storage
+            .write_module_configs(&[("b", true, "{}")])
+            .await
+            .expect("write");
+        storage.close().await;
+    });
+}
+
+#[test]
+fn a_damaged_row_is_replaced_in_one_transaction() {
+    run(async {
+        let root = TempRoot::new("config-replace");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, "not json").await;
+        let storage = product(&root).await;
+        let mut seen = None;
+        let result = storage
+            .replace_module_config_if("a", false, r#"{"fresh":true}"#, |row| {
+                seen = row.cloned();
+                true
+            })
+            .await;
+        assert_eq!(result, Ok(ReplaceCheck::Replaced));
+        assert_eq!(
+            seen,
+            Some(StoredModuleConfig {
+                enabled: 1,
+                settings: "not json".to_owned()
+            })
+        );
+        assert_eq!(
+            module_rows(&layout).await,
+            vec![row("a", 0, r#"{"fresh":true}"#)]
+        );
+        storage.close().await;
+    });
+}
+
+#[test]
+fn a_usable_or_missing_row_is_not_replaced() {
+    run(async {
+        let root = TempRoot::new("config-not-replaced");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, r#"{"keep":1}"#).await;
+        let storage = product(&root).await;
+        let before = fs::read(&layout.database).expect("database");
+
+        let mut seen = None;
+        let result = storage
+            .replace_module_config_if("a", false, "{}", |row| {
+                seen = row.cloned();
+                false
+            })
+            .await;
+        assert_eq!(result, Ok(ReplaceCheck::NotDamaged));
+        assert_eq!(
+            seen,
+            Some(StoredModuleConfig {
+                enabled: 1,
+                settings: r#"{"keep":1}"#.to_owned()
+            })
+        );
+
+        let mut seen_missing = Some(None);
+        let result = storage
+            .replace_module_config_if("missing", false, "{}", |row| {
+                seen_missing = Some(row.cloned());
+                false
+            })
+            .await;
+        assert_eq!(result, Ok(ReplaceCheck::NotDamaged));
+        assert_eq!(seen_missing, Some(None));
+
+        storage.close().await;
+        assert_eq!(fs::read(&layout.database).expect("database"), before);
+        assert_eq!(
+            module_rows(&layout).await,
+            vec![row("a", 1, r#"{"keep":1}"#)]
+        );
+    });
+}
+
+#[test]
+fn a_failed_replacement_keeps_the_damaged_row() {
+    run(async {
+        let root = TempRoot::new("config-replace-fails");
+        let layout = root.layout();
+        session(&layout, MIGRATIONS).await;
+        plant_row(&layout, "a", 1, "not json").await;
+        let storage = product(&root).await;
+        // The new settings break a check of the schema.
+        let result = storage
+            .replace_module_config_if("a", false, "also not json", |_| true)
+            .await;
+        let Err(ConfigStoreError::Database(text)) = result else {
+            panic!("{result:?}");
+        };
+        assert!(
+            text.starts_with("step=config-replace-upsert code=275 "),
+            "{text}"
+        );
+        assert_eq!(module_rows(&layout).await, vec![row("a", 1, "not json")]);
+        storage.close().await;
     });
 }
 
