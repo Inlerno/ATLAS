@@ -6,13 +6,14 @@
 //! the lifecycle manager that applies plans (ADR-014).
 //! Issue #10 (MM-5A): module configuration — the user's decision and settings,
 //! their store, loading at startup and the startup of enabled modules
-//! (ADR-015).
+//! (ADR-015). Issue #21 (MM-5B): the store on SQLite (`config_sqlite`).
 //! Issue #12 (MM-7): demo modules behind the feature `demo-modules`.
 //! Status changes are
 //! published only through the central typed event bus (#8, ADR-013). Modules
 //! are compile-time Rust code; there is no dynamic (DLL) loading.
 
 pub mod config;
+pub mod config_sqlite;
 pub mod context;
 pub mod contract;
 #[cfg(feature = "demo-modules")]

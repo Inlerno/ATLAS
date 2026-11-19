@@ -11,9 +11,6 @@
 //! Plain types only: the storage knows nothing of the module manager. What a
 //! row means — whether its content is usable — is decided by the caller.
 
-// Stage A of #21: the module configuration adapter (stage B) is the caller.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fmt;
 
 use sqlx::sqlite::SqliteConnection;
