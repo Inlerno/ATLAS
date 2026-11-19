@@ -12,7 +12,7 @@ use crate::modules::contract::{
     BlockReason, FailurePhase, Health, ModuleDescriptor, ModuleId, ModuleState, ModuleStatus,
 };
 use crate::modules::manager::{
-    ApplyOutcome, ApplyReport, FailedModule, ModuleSettings, ModuleView,
+    ApplyOutcome, ApplyReport, FailedModule, ModuleSettings, ModuleView, ReplaceOutcome,
 };
 use crate::modules::plan::{Blocker, ChangeAction, ChangePlan, PlanStep};
 
@@ -338,6 +338,28 @@ impl From<ApplyOutcome> for ApplyResultDto {
             ApplyOutcome::NotApplicable(plan) => Self::NotApplicable {
                 blockers: plan.blockers.into_iter().map(Into::into).collect(),
             },
+        }
+    }
+}
+
+/// Result of `replace_module_config` (#21). Both variants are expected
+/// outcomes, not errors; only `replaced` changed anything. A record that is not
+/// damaged (`config_available`), a refused value and a store failure are
+/// errors ([`crate::dto::ErrorDto`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub enum ReplaceResultDto {
+    /// The damaged record was replaced; the module is disabled and stopped.
+    Replaced,
+    /// Nothing changed: the replacement needs the user's confirmation.
+    ConfirmationRequired,
+}
+
+impl From<ReplaceOutcome> for ReplaceResultDto {
+    fn from(outcome: ReplaceOutcome) -> Self {
+        match outcome {
+            ReplaceOutcome::Replaced => Self::Replaced,
+            ReplaceOutcome::ConfirmationRequired => Self::ConfirmationRequired,
         }
     }
 }
@@ -668,6 +690,12 @@ mod tests {
         ] {
             add(to(&ApplyResultDto::from(outcome)));
         }
+        for outcome in [
+            ReplaceOutcome::Replaced,
+            ReplaceOutcome::ConfirmationRequired,
+        ] {
+            add(to(&ReplaceResultDto::from(outcome)));
+        }
         add(to(&ModuleSettingsDto::new(
             &id("t.a"),
             ModuleSettings {
@@ -763,6 +791,7 @@ mod tests {
             "confirmationRequired",
             "impactChanged",
             "notApplicable",
+            "replaced",
             "managerReady",
             "settingsChanged",
         ] {

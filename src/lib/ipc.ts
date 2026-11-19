@@ -17,6 +17,7 @@ import type {
   Module,
   ModuleId,
   ModuleSettings,
+  ReplaceResult,
   Resync,
   UiEvent,
 } from "../types/modules";
@@ -83,6 +84,20 @@ export function updateModuleSettings(
   settings: Record<string, unknown>,
 ): Promise<void> {
   return invoke<void>("update_module_settings", { id, settings });
+}
+
+/**
+ * Replaces the damaged configuration record of a `configUnavailable` module
+ * with `settings` (#21). The module stays disabled. Without `confirmed` nothing
+ * is changed and the answer is `confirmationRequired`: the core checks the
+ * confirmation, the settings and whether the stored record is damaged.
+ */
+export function replaceModuleConfig(
+  id: ModuleId,
+  settings: unknown,
+  confirmed: boolean,
+): Promise<ReplaceResult> {
+  return invoke<ReplaceResult>("replace_module_config", { id, settings, confirmed });
 }
 
 /** Subscribes to module events. Resolves to the function that unsubscribes. */

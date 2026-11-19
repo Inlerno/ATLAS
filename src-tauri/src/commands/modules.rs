@@ -2,8 +2,9 @@
 //!
 //! Each Tauri command is a one-line wrapper around a function that takes the
 //! manager handle, so the same code is tested without a webview. Expected
-//! outcomes of a change come back as [`ApplyResultDto`]; [`ErrorDto`] is only
-//! for real errors.
+//! outcomes of a change come back as [`ApplyResultDto`] (and of a configuration
+//! replacement as [`ReplaceResultDto`], #21); [`ErrorDto`] is only for real
+//! errors.
 
 use serde_json::Value;
 use tauri::State;
@@ -12,6 +13,7 @@ use crate::app::AppState;
 use crate::dto::ErrorDto;
 use crate::dto::modules::{
     ApplyResultDto, ChangeActionDto, ChangePlanDto, HealthDto, ModuleDto, ModuleSettingsDto,
+    ReplaceResultDto,
 };
 use crate::modules::contract::ModuleId;
 use crate::modules::manager::{ManagerError, ModuleManagerHandle};
@@ -115,6 +117,21 @@ pub(crate) async fn update_settings(
     answer("update_module_settings", updated.await)
 }
 
+/// Replaces the damaged configuration record of a `ConfigUnavailable` module
+/// (#21). The manager decides everything: whether the module qualifies,
+/// whether `confirmed` is given, whether the settings are acceptable and
+/// whether the stored record is damaged; nothing is checked or logged here
+/// beyond the command and the error code (`answer`), never the settings.
+pub(crate) async fn replace_config(
+    modules: &ModuleManagerHandle,
+    id: String,
+    settings: Value,
+    confirmed: bool,
+) -> Result<ReplaceResultDto, ErrorDto> {
+    let replaced = modules.replace_config(module_id(id)?, settings, confirmed);
+    answer("replace_module_config", replaced.await)
+}
+
 #[tauri::command]
 pub async fn list_modules(state: Modules<'_>) -> Result<Vec<ModuleDto>, ErrorDto> {
     list(state.modules())
@@ -165,6 +182,16 @@ pub async fn update_module_settings(
     settings: Value,
 ) -> Result<(), ErrorDto> {
     update_settings(state.modules(), id, settings).await
+}
+
+#[tauri::command]
+pub async fn replace_module_config(
+    state: Modules<'_>,
+    id: String,
+    settings: Value,
+    confirmed: bool,
+) -> Result<ReplaceResultDto, ErrorDto> {
+    replace_config(state.modules(), id, settings, confirmed).await
 }
 
 #[cfg(test)]
@@ -443,6 +470,207 @@ mod tests {
             // The snapshot stays readable after the exit (ADR-015).
             assert_eq!(list(m).expect("list").len(), 1);
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_module_config (#21)
+    // -----------------------------------------------------------------------
+
+    /// A manager where `t.a` has a damaged record (`ConfigUnavailable`) and
+    /// `t.b`, enabled, depends on it (blocked).
+    async fn with_damaged_a() -> (Harness, TestStore) {
+        let store = TestStore::default();
+        store.damage("t.a");
+        store.put("t.b", true, json!({}));
+        let h = Harness::spawn(&[("t.a", &[]), ("t.b", &["t.a"])], &[], store.clone());
+        h.ready().await;
+        (h, store)
+    }
+
+    fn state_of(m: &ModuleManagerHandle, module: &str) -> (Option<bool>, ModuleStateDto) {
+        let module = get(m, module.into()).expect("get");
+        (module.enabled, module.state)
+    }
+
+    /// The UI cannot skip the confirmation: without `confirmed` nothing is
+    /// changed and the answer is an outcome, not an error.
+    #[test]
+    fn a_replacement_needs_the_confirmation_and_then_replaces_the_damaged_record() {
+        run(async {
+            let (mut h, store) = with_damaged_a().await;
+            h.events();
+            let m = &h.manager.clone();
+            let unconfirmed = replace_config(m, "t.a".into(), json!({"level": 1}), false)
+                .await
+                .expect("an outcome, not an error");
+            assert_eq!(unconfirmed, ReplaceResultDto::ConfirmationRequired);
+            assert!(matches!(
+                state_of(m, "t.a"),
+                (None, ModuleStateDto::ConfigUnavailable { .. })
+            ));
+            assert!(store.replacements().is_empty());
+            assert!(h.events().is_empty(), "nothing changed");
+
+            let replaced = replace_config(m, "t.a".into(), json!({"level": 1}), true)
+                .await
+                .expect("replaced");
+            assert_eq!(replaced, ReplaceResultDto::Replaced);
+            // Disabled and stopped; nothing is started on its own.
+            assert_eq!(state_of(m, "t.a"), (Some(false), ModuleStateDto::Stopped));
+            assert_eq!(count(&h.probe("t.a").created), 0);
+            let settings = get_settings(m, "t.a".into()).expect("settings");
+            assert_eq!(settings.value, json!({"level": 1}));
+            assert!(settings.valid);
+            // The dependent stays blocked until a confirmed `recover`.
+            assert_eq!(
+                state_of(m, "t.b"),
+                (
+                    Some(true),
+                    ModuleStateDto::Blocked {
+                        by: "t.a".into(),
+                        reason: BlockReasonDto::DependencyConfigUnavailable
+                    }
+                )
+            );
+            assert_eq!(h.events().len(), 2, "SettingsChanged, then StatusChanged");
+        });
+    }
+
+    #[test]
+    fn a_record_that_is_not_damaged_is_reported_and_left_alone() {
+        run(async {
+            let store = TestStore::default();
+            // Readable, but the store failed at startup: ConfigUnavailable.
+            store.put("t.a", true, json!({"keep": 1}));
+            store.fail_load("t.a");
+            // No record at all, and the store failed at startup.
+            store.fail_load("t.b");
+            let h = Harness::spawn(
+                &[("t.a", &[]), ("t.b", &[]), ("t.c", &[])],
+                &[],
+                store.clone(),
+            );
+            h.ready().await;
+            let m = &h.manager;
+            // t.a: the record is readable; t.b: there is none; t.c is not
+            // ConfigUnavailable at all.
+            for module in ["t.a", "t.b", "t.c"] {
+                let error = replace_config(m, module.into(), json!({}), true)
+                    .await
+                    .expect_err("nothing to replace");
+                assert_eq!(error.code, code::CONFIG_AVAILABLE, "{module}");
+                assert!(!error.message.contains(module), "{module}");
+            }
+            assert_eq!(
+                store.record("t.a").map(|config| config.settings),
+                Some(json!({"keep": 1}))
+            );
+            assert_eq!(store.record("t.b"), None);
+            assert!(matches!(
+                state_of(m, "t.a"),
+                (None, ModuleStateDto::ConfigUnavailable { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn replacement_errors_come_back_as_error_dto() {
+        run(async {
+            let (h, store) = with_damaged_a().await;
+            let m = &h.manager;
+            assert_eq!(
+                error_code(replace_config(m, "t.zz".into(), json!({}), true).await),
+                code::UNKNOWN_MODULE
+            );
+            assert_eq!(
+                error_code(replace_config(m, "Not An Id".into(), json!({}), true).await),
+                code::INVALID_ID
+            );
+            // Refused by the module, and by the common checks.
+            assert_eq!(
+                error_code(replace_config(m, "t.a".into(), json!({"invalid": true}), true).await),
+                code::INVALID_SETTINGS
+            );
+            assert_eq!(
+                error_code(replace_config(m, "t.a".into(), json!([1]), true).await),
+                code::INVALID_SETTINGS
+            );
+            assert!(store.replacements().is_empty(), "checked before the write");
+
+            // The store fails: nothing changes, the details stay in the log.
+            store.fail_saves(true);
+            let failed = replace_config(m, "t.a".into(), json!({}), true)
+                .await
+                .expect_err("store error");
+            assert_eq!(failed.code, code::STORE);
+            assert!(!failed.message.contains("/secret/path"));
+            assert!(matches!(
+                state_of(m, "t.a"),
+                (None, ModuleStateDto::ConfigUnavailable { .. })
+            ));
+
+            // After the exit request.
+            store.fail_saves(false);
+            m.shutdown().await.expect("exit");
+            assert_eq!(
+                error_code(replace_config(m, "t.a".into(), json!({}), true).await),
+                code::SHUT_DOWN
+            );
+        });
+    }
+
+    /// The settings never reach an error message or the log: neither when
+    /// they are refused, nor when the store fails, nor when they are saved.
+    #[test]
+    fn replacement_settings_never_reach_messages_or_the_log() {
+        const SECRET_VALUE: &str = "PRIVATE-REPLACE-VALUE";
+        let mut messages = Vec::new();
+        let logs = capture_logs(|| {
+            run(async {
+                let (h, store) = with_damaged_a().await;
+                let m = &h.manager;
+                // A key that looks like a secret: refused, the key is named.
+                let refused =
+                    replace_config(m, "t.a".into(), json!({"password": SECRET_VALUE}), true)
+                        .await
+                        .expect_err("refused");
+                assert_eq!(refused.code, code::INVALID_SETTINGS);
+                assert!(refused.message.contains("password"));
+                messages.push(refused.message);
+                // Refused by the module.
+                let refused =
+                    replace_config(m, "t.a".into(), json!({"invalid": SECRET_VALUE}), true)
+                        .await
+                        .expect_err("refused");
+                messages.push(refused.message);
+                // The store fails.
+                store.fail_saves(true);
+                let failed = replace_config(m, "t.a".into(), json!({"note": SECRET_VALUE}), true)
+                    .await
+                    .expect_err("store error");
+                messages.push(failed.message);
+                // Saved.
+                store.fail_saves(false);
+                replace_config(m, "t.a".into(), json!({"note": SECRET_VALUE}), true)
+                    .await
+                    .expect("replaced");
+                assert_eq!(
+                    store.record("t.a").map(|config| config.settings),
+                    Some(json!({"note": SECRET_VALUE}))
+                );
+                // Not ConfigUnavailable any more.
+                let available =
+                    replace_config(m, "t.a".into(), json!({"note": SECRET_VALUE}), true)
+                        .await
+                        .expect_err("nothing to replace");
+                messages.push(available.message);
+            });
+        });
+        for message in &messages {
+            assert!(!message.contains(SECRET_VALUE), "{message}");
+        }
+        assert!(logs.contains("module configuration replaced"), "{logs}");
+        assert!(!logs.contains(SECRET_VALUE), "{logs}");
     }
 
     #[test]
