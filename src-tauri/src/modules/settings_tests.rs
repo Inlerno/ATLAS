@@ -2100,6 +2100,17 @@ fn a_readable_or_missing_record_is_not_replaced() {
     );
 }
 
+/// The text of the error (for the log and for `Debug`) claims neither that a
+/// record exists nor that it is readable: `ConfigAvailable` comes for both a
+/// readable and a missing record.
+#[test]
+fn the_config_available_error_claims_no_record() {
+    assert_eq!(
+        ManagerError::ConfigAvailable(id("t.a")).to_string(),
+        "no damaged configuration record of module `t.a` was found: nothing was replaced"
+    );
+}
+
 /// Exit rules: after the exit request the command is refused.
 #[test]
 fn a_replacement_after_the_exit_request_is_refused() {
