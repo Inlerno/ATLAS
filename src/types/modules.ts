@@ -145,6 +145,7 @@ export type ErrorCode =
   | "not_ready"
   | "shut_down"
   | "config_unavailable"
+  | "config_available"
   | "store"
   | "internal";
 
