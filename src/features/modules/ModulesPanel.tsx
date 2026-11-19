@@ -1,18 +1,24 @@
 // Modules panel (issue #12): the list of modules with their state, and the
 // actions on them. Everything shown comes from the Rust core; every change
 // goes through it and is confirmed by the user where the core asks for it.
+// A configuration that could not be read can be replaced (issue #21).
 
 import { useState } from "react";
 
 import { applyModuleChange, checkModuleHealth, toIpcError } from "../../lib/ipc";
 import type { ApplyReport, ChangeAction, Module, ModuleId } from "../../types/modules";
+import { ConfigRecovery } from "./ConfigRecovery";
 import { type ChangeDialog, ConfirmChangeDialog } from "./ConfirmChangeDialog";
 import { healthLabel, nameOf, stateDetails, stateLabel } from "./labels";
 import "./modules.css";
+import { blockedBy, canReplaceConfig } from "./recovery";
 import { SettingsEditor } from "./SettingsEditor";
 import { useModules } from "./useModules";
 
 type Notice = { kind: "error" | "info"; text: string };
+
+/** The panel open under a module: its settings or the configuration recovery. One at a time. */
+type OpenPanel = { id: ModuleId; kind: "settings" | "recovery" };
 
 /** What the user is told after a change was applied. `null` — nothing to add. */
 function reportNotice(report: ApplyReport, modules: Module[]): Notice | null {
@@ -35,7 +41,7 @@ export function ModulesPanel() {
   const [dialog, setDialog] = useState<ChangeDialog | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [openSettings, setOpenSettings] = useState<ModuleId | null>(null);
+  const [openPanel, setOpenPanel] = useState<OpenPanel | null>(null);
 
   if (view.phase === "initializing") {
     return (
@@ -89,6 +95,23 @@ export function ModulesPanel() {
     }
   };
 
+  const isOpen = (id: ModuleId, kind: OpenPanel["kind"]) =>
+    openPanel?.id === id && openPanel.kind === kind;
+  const toggle = (id: ModuleId, kind: OpenPanel["kind"]) =>
+    setOpenPanel(isOpen(id, kind) ? null : { id, kind });
+
+  // The new state (disabled, stopped) arrives as events, like every change.
+  const replaced = (id: ModuleId) => {
+    setOpenPanel(null);
+    const blocked = blockedBy(id, modules).length > 0;
+    setNotice({
+      kind: "info",
+      text:
+        `Конфигурация ${nameOf(id, modules)} заменена. Модуль отключён: включите его, когда будете готовы.` +
+        (blocked ? " Заблокированные им модули запустите кнопкой «Восстановить»." : ""),
+    });
+  };
+
   const check = async (id: ModuleId) => {
     setBusy(true);
     setNotice(null);
@@ -120,6 +143,7 @@ export function ModulesPanel() {
             const details = stateDetails(state, modules);
             const running = state.kind === "running";
             const recoverable = state.kind === "failed" || state.kind === "blocked";
+            const replaceable = canReplaceConfig(state);
             return (
               <li key={id} className={`module module-${state.kind}`}>
                 <div className="module-head">
@@ -158,6 +182,16 @@ export function ModulesPanel() {
                 )}
 
                 <div className="module-actions">
+                  {replaceable && (
+                    <button
+                      type="button"
+                      className="primary"
+                      aria-expanded={isOpen(id, "recovery")}
+                      onClick={() => toggle(id, "recovery")}
+                    >
+                      {isOpen(id, "recovery") ? "Скрыть восстановление" : "Восстановить конфигурацию"}
+                    </button>
+                  )}
                   {recoverable && (
                     <button
                       type="button"
@@ -185,14 +219,22 @@ export function ModulesPanel() {
                   )}
                   <button
                     type="button"
-                    aria-expanded={openSettings === id}
-                    onClick={() => setOpenSettings(openSettings === id ? null : id)}
+                    aria-expanded={isOpen(id, "settings")}
+                    onClick={() => toggle(id, "settings")}
                   >
-                    {openSettings === id ? "Скрыть настройки" : "Настройки"}
+                    {isOpen(id, "settings") ? "Скрыть настройки" : "Настройки"}
                   </button>
                 </div>
 
-                {openSettings === id && <SettingsEditor id={id} />}
+                {isOpen(id, "settings") && <SettingsEditor id={id} />}
+                {replaceable && isOpen(id, "recovery") && (
+                  <ConfigRecovery
+                    id={id}
+                    modules={modules}
+                    onReplaced={() => replaced(id)}
+                    onClose={() => setOpenPanel(null)}
+                  />
+                )}
               </li>
             );
           })}
