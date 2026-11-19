@@ -11,6 +11,11 @@
 // `mockIPC(…, { shouldMockEvents: true })` is not used: in @tauri-apps/api
 // 2.12 its `unlisten` reads `id` while `listen()` sends `eventId`, so a
 // removed listener would stay registered in the mock.
+//
+// The event id is the handler's callback id, as in the mock (2.12.4): its
+// `listen` answers `args.handler`, and `unlisten()` releases the callback
+// through `__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener(event,
+// eventId)`, which the mock implements as `unregisterCallback(eventId)`.
 
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { expect, onTestFinished } from "vitest";
@@ -117,12 +122,14 @@ interface Subscription {
   handler: number;
 }
 
-/** Set by `mockIPC`: runs a callback registered with `transformCallback`. */
-function runCallback(handler: number, data: unknown): void {
-  const internals = (
-    window as unknown as { __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void } }
-  ).__TAURI_INTERNALS__;
-  internals.runCallback(handler, data);
+/** Set by `mockIPC`: the callbacks registered with `transformCallback`, and how it runs them. */
+interface MockInternals {
+  callbacks: Map<number, unknown>;
+  runCallback(id: number, data: unknown): void;
+}
+
+function mockInternals(): MockInternals {
+  return (window as unknown as { __TAURI_INTERNALS__: MockInternals }).__TAURI_INTERNALS__;
 }
 
 export class FakeCore {
@@ -133,8 +140,8 @@ export class FakeCore {
   /** Commands nobody set up; the test fails if there are any. */
   readonly unexpected: string[] = [];
   private readonly answers = new Map<string, (args: never) => unknown>();
+  /** By event id, which is the handler's callback id. */
   private readonly subscriptions = new Map<number, Subscription>();
-  private nextEventId = 1;
   private seq = 0;
 
   constructor(modules: Module[]) {
@@ -175,6 +182,11 @@ export class FakeCore {
     return [...this.subscriptions.values()].map((subscription) => subscription.event).sort();
   }
 
+  /** Callbacks the IPC mock still holds: a handler `unlisten()` released is gone. */
+  registeredCallbacks(): number {
+    return mockInternals().callbacks.size;
+  }
+
   /** Changes the snapshot of a module, as the manager does before it publishes. */
   update(id: ModuleId, status: ModuleStatus): void {
     const module = this.modules.get(id);
@@ -189,7 +201,7 @@ export class FakeCore {
     for (const [id, subscription] of this.subscriptions) {
       if (subscription.event === "modules://event") {
         // A copy for each listener: the real IPC delivers serialized events.
-        runCallback(subscription.handler, {
+        mockInternals().runCallback(subscription.handler, {
           event: subscription.event,
           id,
           payload: structuredClone(payload),
@@ -202,12 +214,9 @@ export class FakeCore {
     this.calls.push({ cmd, args: structuredClone(args) });
     switch (cmd) {
       case "plugin:event|listen": {
-        const id = this.nextEventId++;
-        this.subscriptions.set(id, {
-          event: args.event as string,
-          handler: args.handler as number,
-        });
-        return id;
+        const handler = args.handler as number;
+        this.subscriptions.set(handler, { event: args.event as string, handler });
+        return handler;
       }
       case "plugin:event|unlisten":
         this.subscriptions.delete(args.eventId as number);
