@@ -101,12 +101,12 @@ pub enum ManagerError {
     /// in the log (#10, #21).
     #[error("the module configuration could not be saved")]
     Store,
-    /// `replace_config` found the configuration of the module readable: the
-    /// module is not `ConfigUnavailable`, or its stored record turned out
-    /// usable or absent when checked again. Nothing is replaced; a module that
+    /// `replace_config` found no damaged record to replace: the module is not
+    /// `ConfigUnavailable`, or its stored record turned out usable or absent
+    /// when checked again. Nothing is replaced; a module that
     /// stays `ConfigUnavailable` reads its record again at the next start
     /// (#21).
-    #[error("the configuration of module `{0}` is readable: nothing to replace")]
+    #[error("no damaged configuration record of module `{0}` was found: nothing was replaced")]
     ConfigAvailable(ModuleId),
 }
 
