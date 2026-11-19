@@ -101,10 +101,13 @@ impl From<ManagerError> for ErrorDto {
                 code::STORE,
                 "Не удалось сохранить конфигурацию; изменения не применены",
             ),
+            // Returned both when the record is readable and when there is
+            // none: the text claims neither, only that nothing damaged was
+            // found and nothing was replaced (#21, O-10a–c).
             ManagerError::ConfigAvailable(_) => Self::new(
                 code::CONFIG_AVAILABLE,
-                "Конфигурация модуля читается, замена не нужна. Если модуль всё ещё \
-                 недоступен, перезапустите приложение",
+                "Повреждённая запись конфигурации не обнаружена, замена не выполнена. \
+                 Если модуль всё ещё недоступен, перезапустите приложение",
             ),
         }
     }
@@ -201,6 +204,16 @@ mod tests {
             );
             assert!(!dto.message.contains("t.a") && !dto.message.contains("Bad Id"));
         }
+    }
+
+    /// `ConfigAvailable` comes for a readable record and for a missing one:
+    /// the text must not say that a record exists or is readable.
+    #[test]
+    fn config_available_does_not_claim_that_a_record_exists() {
+        let dto = ErrorDto::from(ManagerError::ConfigAvailable(id("t.a")));
+        assert_eq!(dto.code, code::CONFIG_AVAILABLE);
+        let expected = "Повреждённая запись конфигурации не обнаружена, замена не выполнена. Если модуль всё ещё недоступен, перезапустите приложение";
+        assert_eq!(dto.message, expected);
     }
 
     #[test]
