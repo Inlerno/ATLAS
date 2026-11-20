@@ -132,6 +132,9 @@ function ReplaceConfigDialog({ name, blocked, busy, onConfirm, onCancel }: Dialo
       aria-labelledby={title}
       onCancel={(event) => {
         // Esc: the same as «Отмена», and not while the replacement is applied.
+        // Chromium may make `cancel` non-cancelable on repeated Esc; the dialog
+        // then closes while the request runs, and its reply still resets the
+        // state (the pending settings are cleared, the error or notice shown).
         event.preventDefault();
         if (!busy) onCancel();
       }}

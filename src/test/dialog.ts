@@ -8,6 +8,11 @@
 //   closes unless the event was cancelled.
 // Not emulated: the top layer, the inertness of the rest of the page, and
 // focus moving into the dialog (React's autoFocus focuses the element).
+// Not emulated either: Chromium's close watcher makes `cancel` non-cancelable
+// for repeated Esc without user activation (seen in Chrome 153: the third Esc
+// in a row closed the dialog despite preventDefault). Here `cancel` is always
+// cancelable, so the tests show what one Esc does; repeated Esc is for the
+// manual check in WebView2.
 
 export function installDialog(): void {
   const prototype = HTMLDialogElement.prototype;

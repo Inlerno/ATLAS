@@ -2,7 +2,7 @@
 // the real IPC layer (src/test/fakeCore.ts); `recovery.ts` and `lib/ipc.ts`
 // are the real ones.
 
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -206,6 +206,60 @@ describe("ConfigRecovery", () => {
     await waitFor(() => expect(t.onReplaced).toHaveBeenCalledTimes(1));
     expect(t.core.callsOf("replace_module_config")).toHaveLength(2);
   });
+
+  // Chromium (WebView2) may send a non-cancelable `cancel` on repeated Esc and
+  // close the dialog while the confirmed request runs. Whatever the reply,
+  // it must still leave a consistent state.
+  it.each([
+    ["replaced", null],
+    ["store", ERRORS.store],
+  ] as const)(
+    "after the dialog was closed natively, the reply resets the state: %s",
+    async (_, error) => {
+      let answer: (result: ReplaceResult) => void = () => {};
+      let fail: (reason: IpcError) => void = () => {};
+      const reply = new Promise<ReplaceResult>((resolve, reject) => {
+        answer = resolve;
+        fail = reject;
+      });
+      const t = setup(({ confirmed }) => (confirmed ? reply : { outcome: "confirmationRequired" }));
+      await t.type('{"level": 1}');
+      await t.submit();
+      await t.confirm();
+      const dialog = screen.getByRole("dialog", { name: DIALOG }) as HTMLDialogElement;
+
+      // What Chromium does then: a `cancel` that cannot be prevented, then close().
+      act(() => {
+        if (dialog.dispatchEvent(new Event("cancel", { cancelable: false }))) dialog.close();
+      });
+      expect(dialog.open).toBe(false);
+      expect(t.field).toBeDisabled();
+
+      await act(async () => {
+        if (error === null) answer({ outcome: "replaced" });
+        else fail(error);
+      });
+
+      expect(t.dialog()).not.toBeInTheDocument();
+      expect(t.core.callsOf("replace_module_config")).toHaveLength(2);
+      if (error === null) {
+        expect(t.onReplaced).toHaveBeenCalledTimes(1);
+      } else {
+        expect(t.onReplaced).not.toHaveBeenCalled();
+        expect(t.status()).toHaveTextContent(error.message);
+        expect(t.field).toHaveValue('{"level": 1}');
+        expect(t.field).toBeEnabled();
+        // The user can start again: the next request asks for the confirmation anew.
+        await t.submit();
+        expect(screen.getByRole("dialog", { name: DIALOG })).toHaveAttribute("open");
+        expect(t.core.callsOf("replace_module_config").map((call) => call.confirmed)).toEqual([
+          false,
+          true,
+          false,
+        ]);
+      }
+    },
+  );
 
   describe("keeps the typed JSON after an error", () => {
     const TEXT = '{\n  "level": 1,\n  "name": "Ёж"\n}';
