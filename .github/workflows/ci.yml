@@ -81,6 +81,11 @@ jobs:
       - name: Frontend build (tsc + vite)
         run: npm run build
 
+      # Vitest in jsdom: components and IPC calls against a fake core, without
+      # the Tauri runtime (src/test/). A failing test fails the job.
+      - name: Frontend tests (vitest)
+        run: npm test
+
       - name: cargo fmt --check
         working-directory: src-tauri
         run: cargo fmt --check

@@ -97,10 +97,12 @@ impl From<ManagerError> for ErrorDto {
                 code::CONFIG_UNAVAILABLE,
                 "Не удалось прочитать конфигурацию модуля",
             ),
-            ManagerError::Store => Self::new(
-                code::STORE,
-                "Не удалось сохранить конфигурацию; изменения не применены",
-            ),
+            // Neutral (decision O-5, #21): after a write cut short by the exit
+            // deadline the stored outcome is known only at the next start, so
+            // the text does not say that nothing was applied.
+            ManagerError::Store => {
+                Self::new(code::STORE, "Сохранение конфигурации не подтверждено")
+            }
             // Returned both when the record is readable and when there is
             // none: the text claims neither, only that nothing damaged was
             // found and nothing was replaced (#21, O-10a–c).
@@ -204,6 +206,16 @@ mod tests {
             );
             assert!(!dto.message.contains("t.a") && !dto.message.contains("Bad Id"));
         }
+    }
+
+    /// A store error can also be a write the exit deadline cut short, whose
+    /// outcome is known only at the next start: the text claims nothing about
+    /// what was or was not applied.
+    #[test]
+    fn a_store_error_does_not_claim_that_nothing_was_applied() {
+        let dto = ErrorDto::from(ManagerError::Store);
+        assert_eq!(dto.code, code::STORE);
+        assert_eq!(dto.message, "Сохранение конфигурации не подтверждено");
     }
 
     /// `ConfigAvailable` comes for a readable record and for a missing one:

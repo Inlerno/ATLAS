@@ -355,8 +355,6 @@ impl ModuleManagerHandle {
     /// record is left as it is (`ConfigAvailable`). The module stays
     /// disabled; its dependents stay blocked until a confirmed `recover`. On
     /// any error nothing changes in memory.
-    // Stage C of #21: the IPC command (stage D) is the caller.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn replace_config(
         &self,
         id: ModuleId,
@@ -523,8 +521,6 @@ pub(super) enum Command {
         settings: Value,
         reply: oneshot::Sender<Result<(), ManagerError>>,
     },
-    // Stage C of #21: the IPC command (stage D) is the caller.
-    #[cfg_attr(not(test), allow(dead_code))]
     ReplaceConfig {
         id: ModuleId,
         settings: Value,

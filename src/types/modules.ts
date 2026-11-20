@@ -105,6 +105,13 @@ export type ApplyResult =
   | { outcome: "impactChanged"; plan: ChangePlan }
   | { outcome: "notApplicable"; blockers: Blocker[] };
 
+/**
+ * Expected outcomes of replacing a damaged configuration record (#21); none of
+ * them is an error. Only `replaced` changed anything. A record that is not
+ * damaged comes back as the error `config_available`.
+ */
+export type ReplaceResult = { outcome: "replaced" } | { outcome: "confirmationRequired" };
+
 export interface ModuleSettings {
   id: ModuleId;
   /** A JSON object. */

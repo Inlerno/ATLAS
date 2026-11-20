@@ -70,6 +70,7 @@ pub fn run() {
             commands::modules::check_module_health,
             commands::modules::get_module_settings,
             commands::modules::update_module_settings,
+            commands::modules::replace_module_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

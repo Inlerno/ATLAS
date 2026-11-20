@@ -22,7 +22,7 @@
 6. Python не является обязательным runtime конечного продукта.
 
 ## Быстрый старт (Windows)
-Требования: Git for Windows, Node.js `^20.19.0` или `>=22.12.0` (требование Vite 8; рекомендуется актуальный LTS), Rust stable **1.90+** (`x86_64-pc-windows-msvc`), Microsoft C++ Build Tools, WebView2 Runtime — см. официальные Tauri 2 prerequisites.
+Требования: Git for Windows, Node.js `^20.19.0` или `>=22.12.0` (требование Vite 8; рекомендуется актуальный LTS; для `npm test` — `^22.22.2`, `^24.15.0` или `>=26`: требование jsdom 31 и Vitest 5), Rust stable **1.90+** (`x86_64-pc-windows-msvc`), Microsoft C++ Build Tools, WebView2 Runtime — см. официальные Tauri 2 prerequisites.
 
 ```powershell
 git clone https://github.com/Inlerno/ATLAS.git C:\dev\atlas
@@ -68,6 +68,7 @@ npm run tauri dev -- --features demo-modules
 ### Проверки
 ```powershell
 npm run build
+npm test
 cd src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

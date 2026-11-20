@@ -48,14 +48,21 @@ export function stateLabel(state: ModuleState): string {
   }
 }
 
-function blockText(reason: BlockReason, by: string): string {
+function blockText(reason: BlockReason, by: ModuleId, modules: Module[]): string {
+  const name = nameOf(by, modules);
   switch (reason) {
     case "dependencyFailed":
-      return `Зависимость ${by} в состоянии сбоя. Сначала восстановите её.`;
+      return `Зависимость ${name} в состоянии сбоя. Сначала восстановите её.`;
     case "dependencyDisabled":
-      return `Зависимость ${by} отключена.`;
-    case "dependencyConfigUnavailable":
-      return `Конфигурация зависимости ${by} недоступна. Она будет прочитана заново при следующем запуске приложения.`;
+      return `Зависимость ${name} отключена.`;
+    case "dependencyConfigUnavailable": {
+      // The reason stays after the dependency's record is replaced (#21):
+      // the module waits for a confirmed «Восстановить».
+      const dependency = modules.find((module) => module.descriptor.id === by);
+      return dependency === undefined || dependency.state.kind === "configUnavailable"
+        ? `Конфигурация зависимости ${name} недоступна: восстановите её или перезапустите приложение.`
+        : `Конфигурация зависимости ${name} была недоступна. Чтобы запустить модуль, нажмите «Восстановить».`;
+    }
   }
 }
 
@@ -69,9 +76,9 @@ export function stateDetails(state: ModuleState, modules: Module[]): string | nu
     case "failed":
       return `${state.error} (${timeOf(state.at)})`;
     case "blocked":
-      return blockText(state.reason, nameOf(state.by, modules));
+      return blockText(state.reason, state.by, modules);
     case "configUnavailable":
-      return `${state.error} (${timeOf(state.at)}). Конфигурация будет прочитана заново при следующем запуске приложения.`;
+      return `${state.error} (${timeOf(state.at)}). Конфигурация будет прочитана заново при следующем запуске приложения; если запись повреждена, её можно заменить: «Восстановить конфигурацию».`;
     default:
       return null;
   }
@@ -136,7 +143,7 @@ export function blockerLabel(blocker: Blocker, modules: Module[]): string {
     case "blocked":
       return `Сначала восстановите ${name} — сейчас: ${stateLabel(blocker.state).toLowerCase()}.`;
     case "configUnavailable":
-      return `Конфигурация ${name} недоступна до следующего запуска приложения.`;
+      return `Конфигурация ${name} недоступна: восстановите её или перезапустите приложение.`;
     default:
       return `${name} — сейчас: ${stateLabel(blocker.state).toLowerCase()}.`;
   }
